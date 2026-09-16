@@ -55,6 +55,8 @@
 | `wm811k_structural.py` | 구조적 특징 추가 (연결 성분, 각도 커버리지, 반경 프로파일) 및 비교 |
 | `wm811k_validate.py` | 로트 분할 5회 반복 검증, 위치 특징 3개 추가, RF 규제 선택 |
 | `wm811k_improve.py` | 노이즈에 강건한 구조 특징 8개 추가 + 그래디언트 부스팅 비교 (아래 "다음 실험" 참고) |
+| `tests/synthetic_wm811k.py` | 합성 웨이퍼로 LSWMD.pkl 형식의 가짜 데이터 생성 (파이프라인 스모크 테스트용) |
+| `tests/test_pipeline.py` | 특징 추출 방향 검증 + prepare → improve 전체 실행 테스트 (`pytest -q`) |
 
 ## 실행
 
@@ -67,6 +69,7 @@ python prepare_wm811k.py                 # → data/wm811k_defects.pkl
 # 2. 합성 데이터로 파이프라인 검증
 python wafer_pattern_classifier.py       # noise 0 / 0.03 각각 7/7 일치, 실패 시 종료 코드 1
 python batch_wafer_report.py             # PDF 리포트
+pip install -r requirements-dev.txt && pytest -q   # 특징 방향 + 전체 파이프라인 스모크 테스트 (약 1분)
 
 # 3. 실측 평가
 python wm811k_evaluate.py                # 미교정 규칙, macro-F1 0.167
