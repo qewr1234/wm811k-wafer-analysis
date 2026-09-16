@@ -54,6 +54,7 @@
 | `wm811k_calibrate.py` | 임계값 교정 (train 로트) + 결정트리/RF 기준선 |
 | `wm811k_structural.py` | 구조적 특징 추가 (연결 성분, 각도 커버리지, 반경 프로파일) 및 비교 |
 | `wm811k_validate.py` | 로트 분할 5회 반복 검증, 위치 특징 3개 추가, RF 규제 선택 |
+| `wm811k_improve.py` | 노이즈에 강건한 구조 특징 8개 추가 + 그래디언트 부스팅 비교 (아래 "다음 실험" 참고) |
 
 ## 실행
 
@@ -64,7 +65,7 @@ pip install -r requirements.txt
 python prepare_wm811k.py                 # → data/wm811k_defects.pkl
 
 # 2. 합성 데이터로 파이프라인 검증
-python wafer_pattern_classifier.py       # 7/7 일치 확인
+python wafer_pattern_classifier.py       # noise 0 / 0.03 각각 7/7 일치, 실패 시 종료 코드 1
 python batch_wafer_report.py             # PDF 리포트
 
 # 3. 실측 평가
@@ -72,15 +73,33 @@ python wm811k_evaluate.py                # 미교정 규칙, macro-F1 0.167
 python wm811k_calibrate.py               # 교정 + 트리 비교
 python wm811k_structural.py              # 구조적 특징 비교 → 0.878
 python wm811k_validate.py                # 반복 검증 + 위치 특징 → 0.907 ± 0.008
+python wm811k_improve.py                 # 강건 특징 8개 + HGB, 같은 5분할에서 짝지어 비교
 ```
 
-데이터 경로는 `WM811K_DIR` 환경변수로 바꿀 수 있다.
+데이터 경로는 `WM811K_DIR` 환경변수로 바꿀 수 있다. 특징 캐시(`wm811k_features*.csv`)와 결과 파일은 스크립트 옆에 생기며 `.gitignore`로 제외된다.
+
+합성 자체 검증에서 clean 웨이퍼에 noise를 주면 뒤집힌 다이 비율이 CLEAN 임계값 2% 근처에서 흔들리므로 CLEAN과 RANDOM을 모두 정답으로 인정한다. 그래도 균일 무작위 불량의 평균 반경(약 0.67)이 엣지 임계값 0.70에 붙어 있어 소수 불량 웨이퍼가 EDGE_LOC로 새는 경우가 있다. 미교정 규칙이 노이즈에 약하다는 것을 합성 데이터에서도 볼 수 있는 사례라 그대로 두었다.
+
+## 다음 실험 — `wm811k_improve.py` (실측 미측정)
+
+남은 오류(LOC→EDGE_LOC 542장, SCRATCH→LOC 270장)를 겨냥해 특징 8개를 추가하고, 같은 특징으로 RF와 HistGradientBoosting을 같은 로트 분할 5개에서 짝지어 비교하는 스크립트다. 진단은 5번 항목의 n_comp AUC 0.155에서 출발한다. 기존 연결 성분 특징은 산발 불량 다이 1개를 성분 1개로 세므로 패턴이 아니라 노이즈 수준을 재고 있었다.
+
+| 특징 | 겨냥 |
+|---|---|
+| `isolated_frac`, `sig_frac`, `n_comp_sig` | 고립 다이(크기 1)와 크기 3 이상 성분을 분리해 노이즈와 패턴을 구분 |
+| `fail_nb_mean` | 불량 다이당 8-이웃 불량 수. RANDOM은 낮고 덩어리는 높다 |
+| `big_extent`, `big_len` | 최대 성분의 바운딩 박스 채움 비율과 주축 길이. 선(SCRATCH)과 덩어리(LOC) 구분 |
+| `big_edge_touch` | 최대 성분 다이 중 웨이퍼 가장자리에 닿은 비율. EDGE_LOC↔LOC 혼동을 직접 겨냥 |
+| `second_frac` | 두 번째 성분 / 최대 성분 |
+
+이 저장소에서 실측 수치는 아직 내지 않았다. 합성 WM-811K 형식 데이터로 파이프라인 전체(prepare → evaluate → calibrate → structural → validate → improve)가 끝까지 도는 것만 확인했으며, 합성에서의 F1은 성능이 아니다. 채택 기준은 validate와 같다: 5회 모두 개선이고 Δ 평균이 분할 간 표준편차보다 커야 한다.
 
 ## 설계 원칙
 
 - **합성 데이터의 역할을 제한한다.** 생성기와 분류기가 규칙을 공유하므로 합성 데이터의 정확도는 성능이 아니다. 렌더러·분류 로직의 코딩 오류를 잡는 용도로만 쓴다.
 - **분할 단위는 로트.** WM-811K의 `lotName`으로 group split. 같은 로트가 train/test에 섞이면 부풀려진다.
 - **임계값은 train에서만.** 전체 데이터로 맞추면 test 점수가 낙관적으로 편향된다.
+- **macro-F1은 결함 8종으로 고정.** 예측에만 등장한 CLEAN을 라벨 집합에 넣으면 F1 0인 9번째 클래스가 평균을 끌어내린다. 모든 스크립트가 같은 8종으로 계산한다.
 - **수작업 규칙은 같은 특징의 트리와 비교한다.** 임계값을 교정하는 순간 손으로 트리를 적합하는 것이므로, 실제 트리보다 나은지 확인해야 한다.
 
 ## 한계

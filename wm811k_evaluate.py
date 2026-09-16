@@ -7,7 +7,10 @@
 #
 # 평가 설계
 #   - accuracy 사용 금지. WM-811K는 Edge-Ring 9,680 vs Near-full 149 로
-#     37배 불균형이다. macro-F1과 balanced accuracy를 주 지표로 쓴다.
+#     65배 불균형이다. macro-F1과 balanced accuracy를 주 지표로 쓴다.
+#   - macro-F1은 결함 클래스 8종(CLASSES)으로 고정해 계산한다. 예측에만
+#     등장한 CLEAN을 라벨 집합에 넣으면 F1 0인 9번째 클래스가 평균을
+#     끌어내려 wm811k_calibrate.py 이후의 숫자와 어긋난다(0.146 vs 0.167).
 #   - 분류기에 학습된 파라미터가 없으므로(임계값을 이 데이터로 맞추지 않았다)
 #     전체 25,519장 평가가 편향되지 않는다. 단 이후 임계값을 교정할 경우
 #     반드시 lot 단위 group split의 train 쪽에서만 해야 한다.
@@ -50,6 +53,9 @@ LABEL_MAP = {
     "none": "CLEAN",
 }
 MIN_DIE = 100          # 다이가 너무 적은 맵은 반경 통계가 불안정하다
+# macro-F1 계산에 쓰는 클래스. 교정 스크립트들과 동일하게 결함 8종으로 고정한다.
+CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
+           "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
 
 
 def _unwrap(v):
@@ -144,9 +150,11 @@ def lot_group_split(res: pd.DataFrame, test_frac: float = 0.3,
 def report(res: pd.DataFrame, title: str) -> dict:
     ok = res[~res["skipped"]]
     y_true, y_pred = ok["y_true"], ok["y_pred"]
+    # 표에는 CLEAN 예측 열도 보여주되, 지표는 결함 8종으로만 계산한다.
     labels = sorted(set(y_true) | set(y_pred))
+    metric_labels = [c for c in CLASSES if c in set(y_true)] or CLASSES
 
-    macro_f1 = f1_score(y_true, y_pred, average="macro", labels=labels,
+    macro_f1 = f1_score(y_true, y_pred, average="macro", labels=metric_labels,
                         zero_division=0)
     bal_acc = balanced_accuracy_score(y_true, y_pred)
     acc = (y_true == y_pred).mean()
@@ -195,7 +203,8 @@ def main(path: Path | None = None, include_none: bool = False):
     print(df["ftype"].value_counts().to_string())
 
     res = classify_all(df)
-    res.to_csv("wm811k_predictions.csv", index=False, encoding="utf-8-sig")
+    out_csv = Path(__file__).resolve().parent / "wm811k_predictions.csv"
+    res.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
     # 전체 평가 — 임계값을 이 데이터로 맞추지 않았으므로 편향 없음
     report(res, "전체")
@@ -215,11 +224,12 @@ def main(path: Path | None = None, include_none: bool = False):
     for s in ["train", "test"]:
         sub = res[res["split"] == s]
         ok = sub[~sub["skipped"]]
-        f1 = f1_score(ok["y_true"], ok["y_pred"], average="macro", zero_division=0)
+        f1 = f1_score(ok["y_true"], ok["y_pred"], average="macro",
+                      labels=CLASSES, zero_division=0)
         print(f"  {s:5s} n={len(ok):6d} 로트={sub['lot'].nunique():5d} "
               f"macro-F1={f1:.4f}")
 
-    print("\n저장: wm811k_predictions.csv")
+    print(f"\n저장: {out_csv}")
 
 
 if __name__ == "__main__":

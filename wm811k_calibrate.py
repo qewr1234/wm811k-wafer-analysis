@@ -2,7 +2,7 @@
 # WM-811K — 임계값 교정 + 결정트리 기준선 비교
 #
 # 배경
-#   미교정 규칙 기반 분류기의 실측 macro-F1은 0.146이었다.
+#   미교정 규칙 기반 분류기의 실측 macro-F1은 0.167이었다(test 로트, 결함 8종 기준).
 #   특징별 단일 AUC를 보면 신호는 존재한다(EDGE_RING r_mean 0.956,
 #   NEAR_FULL fail_frac 1.000, CENTER r_mean 0.894·r_std 0.966).
 #   원인은 특징 부재가 아니라 임계값이 노이즈 없는 합성 데이터에서
@@ -43,8 +43,9 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 from wafer_map_visualizer import wafermap_to_df
 from wafer_pattern_classifier import classify_wafer_pattern
 
-DATA_DIR = Path(os.getenv("WM811K_DIR", Path(__file__).resolve().parent / "data"))  # 환경변수 또는 스크립트 옆 data/
-FEATURE_CACHE = Path("wm811k_features.csv")
+HERE = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("WM811K_DIR", HERE / "data"))   # 환경변수 또는 스크립트 옆 data/
+FEATURE_CACHE = HERE / "wm811k_features.csv"               # 실행 폴더와 무관하게 스크립트 옆에
 
 CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
            "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
@@ -80,7 +81,7 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
         df["ftype"] = df["failureType"].apply(
             lambda v: str(np.asarray(v).reshape(-1)[0]) if np.asarray(v).size else None
         )
-    df["lot"] = df.get("lotName", "unknown").astype(str)
+    df["lot"] = (df["lotName"] if "lotName" in df.columns else "unknown").astype(str)
     df = df[df["ftype"].isin(LABEL_MAP)].copy()
     df["y_true"] = df["ftype"].map(LABEL_MAP)
 
@@ -340,8 +341,9 @@ def main(path: Path | None = None):
 
     F["y_rule_tuned"] = apply_rules(F, tuned)
     F["y_tree"] = tree.predict(F[FEATURES].to_numpy())
-    F.to_csv("wm811k_calibrated.csv", index=False, encoding="utf-8-sig")
-    print("저장: wm811k_calibrated.csv, wm811k_features.csv")
+    out_csv = HERE / "wm811k_calibrated.csv"
+    F.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print(f"저장: {out_csv}\n      {FEATURE_CACHE}")
 
 
 if __name__ == "__main__":

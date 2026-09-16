@@ -80,6 +80,27 @@ class WaferPatternResult:
     recommended_action: str = field(default="")
 
 
+# 합성 생성기의 defect_mode → 분류기가 내야 할 클래스
+EXPECTED_BY_MODE: dict[str, str] = {
+    "ring": "EDGE_RING", "center": "CENTER", "scratch": "SCRATCH",
+    "random": "RANDOM", "donut": "DONUT", "edge_loc": "EDGE_LOC",
+    "clean": "CLEAN",
+}
+
+
+def expected_patterns(defect_mode: str, noise: float = 0.0) -> frozenset[str]:
+    """합성 웨이퍼에서 정답으로 인정할 클래스 집합.
+
+    clean 모드에 noise를 주면 다이의 약 noise 비율이 FAIL로 뒤집힌다.
+    뒤집힌 비율은 웨이퍼마다 CLEAN_FAIL_FRAC(2%) 근처에서 흔들리므로,
+    규칙상 CLEAN과 RANDOM(산발 불량) 둘 다 그 맵을 옳게 읽은 것이다.
+    CLEAN만 기대하면 자체 검증이 코딩 오류가 아닌 MISS를 낸다.
+    """
+    if defect_mode == "clean" and noise > 0:
+        return frozenset({"CLEAN", "RANDOM"})
+    return frozenset({EXPECTED_BY_MODE[defect_mode]})
+
+
 def _circular_stats(angles_deg: np.ndarray) -> tuple[float, float]:
     """방향 집중도와 축 집중도를 반환.
 
@@ -207,12 +228,8 @@ if __name__ == "__main__":
     # 생성기와 분류기가 같은 규칙을 공유하므로 전부 맞히는 것은 성능이 아니라
     # 코딩 오류가 없다는 확인까지다. 실제 정확도는 WM-811K로 재야 한다.
     modes = ["ring", "center", "scratch", "random", "donut", "edge_loc", "clean"]
-    expected = {
-        "ring": "EDGE_RING", "center": "CENTER", "scratch": "SCRATCH",
-        "random": "RANDOM", "donut": "DONUT", "edge_loc": "EDGE_LOC",
-        "clean": "CLEAN",
-    }
 
+    n_miss_total = 0
     for noise in (0.0, 0.03):
         print(f"\n{'=' * 62}")
         print(f"noise = {noise}")
@@ -221,7 +238,8 @@ if __name__ == "__main__":
         for mode in modes:
             df = generate_sample_wafer_data(defect_mode=mode, noise=noise)
             res = classify_wafer_pattern(df)
-            ok = res.pattern == expected[mode]
+            exp = expected_patterns(mode, noise)
+            ok = res.pattern in exp
             n_ok += ok
             print(f"\n[{mode.upper()}] → {res.pattern}  {'OK' if ok else 'MISS'}")
             print(f"  score {res.score:.3f} | 수율 {res.yield_pct:.1f}% | "
@@ -230,5 +248,9 @@ if __name__ == "__main__":
                   f"r_std/R {res.r_std_norm:.3f} | "
                   f"dir {res.dir_concentration:.3f} | axial {res.axial_concentration:.3f}")
             if not ok:
-                print(f"  기대: {expected[mode]}")
+                print(f"  기대: {'/'.join(sorted(exp))}")
         print(f"\n일치 {n_ok}/{len(modes)}")
+        n_miss_total += len(modes) - n_ok
+
+    # 자체 검증이 깨지면 종료 코드로 알린다 (CI 등에서 잡을 수 있게)
+    raise SystemExit(1 if n_miss_total else 0)

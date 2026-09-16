@@ -33,7 +33,7 @@ from plotly.subplots import make_subplots
 
 DEFECT_MODES = ("ring", "center", "donut", "edge_loc", "scratch", "random", "clean")
 
-# 측정 파라미터 기본값 — process_data_generator의 CVD 타깃과 맞춤
+# 측정 파라미터 기본값 — CVD 산화막 두께(Å)를 가정한 임의값
 TARGET_A = 435.0
 SPEC_FRAC = 0.05
 DEPRESSION_A = 45.0     # 결함 영역의 두께 저하량 (스펙 폭의 약 2배)
@@ -48,6 +48,7 @@ class WaferField:
     target: float
     spec_lo: float
     spec_hi: float
+    radius: float               # 웨이퍼 반경 (셀 단위) — 경계 원 그리기용
 
     @property
     def n_die(self) -> int:
@@ -117,7 +118,8 @@ def create_wafer_heatmap_data(
 
     tol = target * spec_frac
     return WaferField(Z=Z, x=coords, y=coords, target=target,
-                      spec_lo=target - tol, spec_hi=target + tol)
+                      spec_lo=target - tol, spec_hi=target + tol,
+                      radius=wafer_radius)
 
 
 def create_interactive_wafer_heatmap(
@@ -186,8 +188,8 @@ def create_interactive_wafer_heatmap(
             row=r, col=c,
         )
 
-        # 웨이퍼 경계
-        fig.add_shape(type="circle", x0=-14.5, y0=-14.5, x1=14.5, y1=14.5,
+        # 웨이퍼 경계 — 데이터의 반경을 그대로 쓴다 (하드코딩하면 인자와 어긋난다)
+        fig.add_shape(type="circle", x0=-f.radius, y0=-f.radius, x1=f.radius, y1=f.radius,
                       line=dict(color="#455A64", width=1.5),
                       row=r, col=c)
 
