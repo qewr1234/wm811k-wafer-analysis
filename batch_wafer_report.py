@@ -51,7 +51,7 @@ from wafer_map_visualizer import (
     generate_sample_wafer_data,
     plot_wafer_map,
 )
-from wafer_pattern_classifier import classify_wafer_pattern
+from wafer_pattern_classifier import classify_wafer_pattern, expected_patterns
 
 A4_LANDSCAPE = (11.69, 8.27)
 MAX_COLS = 3
@@ -59,13 +59,8 @@ NOISE = 0.03
 YIELD_WARN = 90.0
 
 ALL_MODES = ["ring", "center", "donut", "edge_loc", "scratch", "random", "clean"]
-
-# defect_mode → 분류기가 내야 할 클래스. 요약표의 일치 여부 판정용.
-EXPECTED = {
-    "ring": "EDGE_RING", "center": "CENTER", "donut": "DONUT",
-    "edge_loc": "EDGE_LOC", "scratch": "SCRATCH", "random": "RANDOM",
-    "clean": "CLEAN",
-}
+# 일치 판정은 wafer_pattern_classifier.expected_patterns(mode, NOISE) 로 한다.
+# clean 로트에 NOISE 3%를 섞으면 CLEAN 임계값 2% 근처가 되어 CLEAN/RANDOM 둘 다 정답이다.
 
 # Windows / macOS / Linux 순으로 한글 폰트를 찾는다.
 KOREAN_FONTS = ["Malgun Gothic", "AppleGothic", "NanumGothic",
@@ -224,7 +219,7 @@ def _lot_page(pdf: PdfPages, lot_id: str, mode: str, wafers_per_lot: int,
         if leg:
             leg.remove()
 
-        matched = res.pattern == EXPECTED.get(mode)
+        matched = res.pattern in expected_patterns(mode, NOISE)
         # 분류 결과를 제목에 넣는다. 원본은 입력 정답을 그대로 출력했다.
         ax.set_title(
             f"{wafer_id}  수율 {res.yield_pct:.1f}%  FAIL {res.fail_count}\n"

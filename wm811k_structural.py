@@ -1,9 +1,9 @@
 # wm811k_structural.py
 # WM-811K — 구조적 특징 추가 및 "전역 요약 통계 vs 구조적 특징" 비교
 #
-# 배경 (교정 실험 결과, test macro-F1)
-#   규칙 미교정 0.167 → 규칙 교정 0.540 → 결정트리 0.689 → 랜덤포레스트 0.767
-#   남은 병목: SCRATCH 0.131/0.319, EDGE_LOC 0.514/0.664, LOC 0.416/0.432
+# 배경 (wm811k_calibrate.py 결과, test macro-F1, 시드 42 단일 분할)
+#   규칙 미교정 0.167 → 규칙 교정 0.558 → 결정트리 0.710 → 랜덤포레스트 0.765
+#   남은 병목: SCRATCH(트리 F1 0.319), EDGE_LOC, LOC
 #   교정이 scratch_axial을 0.50 → 0.10 까지 내린 것은 정밀도를 버리고
 #   재현율만 긁은 것(precision 0.116)이며, 임계값으로는 해결 불가라는 신호다.
 #
@@ -234,6 +234,9 @@ def auc_table(F: pd.DataFrame, feats: list[str]) -> pd.DataFrame:
 # ──────────────────────────────────────────
 @dataclass(frozen=True)
 class RuleParams:
+    # 기본값은 wm811k_calibrate.py 가 같은 train 로트(시드 42)에서 교정한 값이다.
+    # 합성 기준값(wafer_pattern_classifier.py)이 아니므로 좌표 하강의 시작점이
+    # calibrate 스크립트와 다르다. 다른 분할에서 쓰려면 이 값도 다시 교정할 것.
     clean_frac: float = 0.02
     nearfull_frac: float = 0.75
     center_r: float = 0.74

@@ -1,0 +1,13 @@
+# 원본 데이터와 추출본 (수 GB) — 커밋하지 않는다
+data/*.pkl
+
+# 스크립트가 만드는 산출물
+*.csv
+*.pdf
+*.png
+*.html
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.pytest_cache/
