@@ -6,6 +6,7 @@ data/*.pkl
 *.pdf
 *.png
 *.html
+spc/
 
 __pycache__/
 *.pyc
