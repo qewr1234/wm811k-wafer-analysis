@@ -4,8 +4,11 @@
 # 용도는 파이프라인 스모크 테스트뿐이다. 생성기와 분류기가 규칙을 공유하므로
 # 여기서 나오는 F1은 성능이 아니다. 실측 수치는 반드시 실제 LSWMD.pkl로 낼 것.
 #
+# 결함 로트 외에 정상(none) 로트도 만든다. 실측은 none 이 85% 지만 여기서는 결함 로트의
+# 절반만 만든다(스모크 테스트 시간). 1단계 검출(wm811k_detect.py)이 이 라벨을 쓴다.
+#
 # 사용: python tests/synthetic_wm811k.py [출력 경로] [로트 수]
-#   기본값: data/LSWMD_synthetic.pkl, 120 로트
+#   기본값: data/LSWMD_synthetic.pkl, 120 로트 (+ 정상 60 로트)
 
 from __future__ import annotations
 
@@ -58,9 +61,24 @@ def make_wafermap(mode: str, seed: int, rng: np.random.Generator) -> np.ndarray:
     return df_to_wafermap(df, die)
 
 
-def make_lswmd(n_lots: int = 120, n_unlabeled: int = 50, seed: int = 0) -> pd.DataFrame:
+def make_none_wafermap(seed: int, rng: np.random.Generator) -> np.ndarray:
+    """정상(none) 웨이퍼. 패턴 없이 산발 불량만 0~4% 깔린다.
+    실측 none 은 불량이 꽤 많은 맵도 섞여 있어 fail_frac 만으로는 갈리지 않는다는 점을 흉내 낸다."""
+    diam = float(rng.choice([200, 250, 300, 350]))
+    die = float(rng.choice([8, 10, 12]))
+    noise = float(rng.uniform(0.0, 0.04))
+    df = generate_sample_wafer_data(wafer_diameter_mm=diam, die_size_mm=die,
+                                    defect_mode="clean", noise=noise, seed=seed)
+    return df_to_wafermap(df, die)
+
+
+def make_lswmd(n_lots: int = 120, n_unlabeled: int = 50, seed: int = 0,
+               n_none_lots: int | None = None) -> pd.DataFrame:
     """LSWMD.pkl 과 같은 컬럼(waferMap, dieSize, lotName, waferIndex,
-    trianTestLabel, failureType)을 가진 DataFrame. 라벨은 (1,1) ndarray 로 포장한다."""
+    trianTestLabel, failureType)을 가진 DataFrame. 라벨은 (1,1) ndarray 로 포장한다.
+
+    n_lots 는 결함 로트 수, n_none_lots 는 정상 로트 수(기본 n_lots // 2).
+    정상 로트는 결함 로트 뒤에 만들므로 같은 seed 면 결함 로트는 이전과 동일하다."""
     rng = np.random.default_rng(seed)
     modes = list(LABELS)
     rows, i = [], 0
@@ -74,6 +92,23 @@ def make_lswmd(n_lots: int = 120, n_unlabeled: int = 50, seed: int = 0) -> pd.Da
                 "lotName": f"lot{lot}", "waferIndex": w,
                 "trianTestLabel": np.array([["Training"]]),
                 "failureType": np.array([[LABELS[m]]]),
+            })
+            i += 1
+    if n_none_lots is None:
+        n_none_lots = n_lots // 2
+    for lot in range(n_lots, n_lots + n_none_lots):
+        for w in range(int(rng.integers(8, 20))):
+            # 정상 로트에도 가끔 결함 웨이퍼가 섞인다 (실측도 로트 전체가 깨끗하지는 않다)
+            if rng.random() < 0.05:
+                m = rng.choice(modes)
+                wmap, label = make_wafermap(m, i, rng), LABELS[m]
+            else:
+                wmap, label = make_none_wafermap(i, rng), "none"
+            rows.append({
+                "waferMap": wmap, "dieSize": 1.0,
+                "lotName": f"lot{lot}", "waferIndex": w,
+                "trianTestLabel": np.array([["Training"]]),
+                "failureType": np.array([[label]]),
             })
             i += 1
     empty = np.array([]).reshape(0, 0)          # 원본의 라벨 없는 맵

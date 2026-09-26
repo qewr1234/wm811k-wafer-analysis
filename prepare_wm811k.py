@@ -4,8 +4,8 @@
 #   기본값: data/LSWMD.pkl → data/
 #
 # 출력
-#   data/wm811k_labeled.pkl  라벨 있는 172,950장 (none 포함)
-#   data/wm811k_defects.pkl  결함 패턴 25,519장 (none 제외) — 평가 스크립트가 쓰는 파일
+#   data/wm811k_labeled.pkl  라벨 있는 172,950장 (none 포함) — 1단계 검출(wm811k_detect.py)이 쓰는 파일
+#   data/wm811k_defects.pkl  결함 패턴 25,519장 (none 제외) — 패턴 분류 스크립트들이 쓰는 파일
 #
 # 원본 데이터: WM-811K (MIR Lab). Kaggle "wm811k-wafer-map" 에서 LSWMD.pkl 다운로드.
 # 원본 파일은 저장소에 포함하지 않는다.
