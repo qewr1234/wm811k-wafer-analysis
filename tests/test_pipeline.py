@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -108,3 +109,14 @@ def test_pipeline_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(imp, "SEEDS", [42, 0])
     imp.main(defects)
     assert (tmp_path / "wm811k_improve_results.csv").exists()
+
+    # 1단계 검출 — none 을 포함한 labeled 파일로 끝까지 도는지. 숫자는 보지 않는다.
+    import wm811k_detect as det
+    labeled = tmp_path / "wm811k_labeled.pkl"
+    assert labeled.exists()
+    R = det.main(labeled, far=0.02, workers=1, seeds=[42, 0], out_dir=tmp_path, cache=tmp_path / "all.csv")
+    assert len(R) == 2 and set(["roc_auc", "e2e_macro_f1", "oracle_macro_f1"]) <= set(R.columns)
+    assert (R["far_actual@0.02"] <= 0.02 + 0.05).all()          # 운영점이 train 에서 정해져 test 에 이식됐는지
+    cm9 = pd.read_csv(tmp_path / "wm811k_detect_confusion.csv", index_col=0)
+    assert cm9.shape == (9, 9) and cm9.to_numpy().sum() > 0
+    assert (tmp_path / "wm811k_detect_curve.png").exists()
