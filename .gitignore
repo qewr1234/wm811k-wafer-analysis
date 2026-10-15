@@ -7,6 +7,34 @@ data/*.pkl
 *.png
 *.html
 spc/
+spc_ci/
+slot_ci/
+commonality_ci/
+log.txt
+# 현장 분석 스크립트의 기본 출력 폴더 (--output 미지정 시 스크립트 옆에 생긴다)
+azimuth_out/
+azimuth_demo/
+scratch_out/
+scratch_demo/
+slot_out/
+slot_demo/
+commonality_out/
+commonality_demo/
+lot_report_out/
+lot_report_demo/
+
+# 예외: 실측 수치의 재현 근거 (results/README.md 참고) 와 문서용 그림·샘플·폰트
+!results/*.csv
+!results/*.txt
+!results/*.md
+!docs/img/*.png
+!docs/img/*.svg
+!docs/samples/*.pdf
+!docs/fonts/*
+
+# 예외 뒤에 두어 results/ 안에서도 계속 제외되는 것: 웨이퍼별 예측(로트명 포함, 용량), SPC 로트 이력
+test_predictions.csv
+*.lot_history.csv
 
 __pycache__/
 *.pyc

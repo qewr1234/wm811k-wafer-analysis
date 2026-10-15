@@ -1,0 +1,31 @@
+# results/environment.txt
+# README 실측 수치(macro-F1 0.907 +- 0.008 등)를 낸 PC 의 환경 기록.
+#
+# [소유자가 채울 것] 숫자를 낸 PC 에서 아래 명령을 실행해 이 파일을 덮어쓴다:
+#   python -c "import sys, platform, numpy, pandas, scipy, sklearn, matplotlib; print('python', sys.version.split()[0], platform.platform()); print('numpy', numpy.__version__); print('pandas', pandas.__version__); print('scipy', scipy.__version__); print('scikit-learn', sklearn.__version__); print('matplotlib', matplotlib.__version__)" > results/environment.txt
+#   pip freeze >> results/environment.txt
+# 실행 날짜와 데이터 파일(LSWMD.pkl 의 크기 또는 sha256)도 한 줄 적어 두면 좋다.
+
+[measured]   # 실측 수치를 낸 환경 - 아직 기록되지 않음
+python        : (미기록)
+platform      : (미기록)
+numpy         : (미기록)
+pandas        : (미기록)
+scipy         : (미기록)
+scikit-learn  : (미기록)
+matplotlib    : (미기록)
+date          : (미기록)
+data          : LSWMD.pkl (Kaggle wm811k-wafer-map), size/sha256 (미기록)
+
+[reference]  # 이 저장소를 정비한 세션의 환경 (참고용. 숫자를 낸 환경이 아니며, LSWMD.pkl 이 없어 실측을 재현하지 않았다)
+python        : 3.11.15
+platform      : Linux-6.18.44-x86_64-glibc2.39
+numpy         : 2.4.6
+pandas        : 3.0.5
+scipy         : 1.17.1
+scikit-learn  : 1.9.1
+matplotlib    : 3.11.2
+plotly        : 7.1.0
+pytest        : 9.1.1
+date          : 2026-10-15
+note          : 합성 데이터(tests/synthetic_wm811k.py)로 전 스크립트가 끝까지 도는 것만 확인. 합성 F1 은 성능이 아니다.

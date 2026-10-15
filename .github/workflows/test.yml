@@ -4,16 +4,46 @@ on:
   push:
   pull_request:
 
+# 합성 데이터 자체 검증 + pytest + SPC 데모. 모두 코딩 오류 확인이지 성능이 아니다.
+# 실측 수치(README)는 LSWMD.pkl 이 필요해 CI 에서 재측정하지 않는다 (results/ 참고).
+# 한글 폰트는 docs/fonts/ 에 동봉되므로 apt 설치 단계가 없다.
+
 jobs:
   synthetic-checks:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt
-      # 합성 데이터 자체 검증 — 코딩 오류 확인이지 성능이 아니다
+
+      # 규칙 분류기 자체 검증 (7/7 이 아니면 종료 코드 1)
       - run: python wafer_pattern_classifier.py
-      - run: pytest -q
+
+      # 특징 스냅샷·내보내기·SPC·파이프라인 테스트
+      - run: python -m pytest -q
+
+      # SPC 데모 (합성 시퀀스; 탐지 로직 확인용)
+      - run: python wm811k_spc.py --demo --output spc_ci
+
+      # Windows: 파일 리다이렉트 시 stdout 이 cp949 가 되는 경로를 그대로 검증 (UnicodeEncodeError 회귀)
+      - if: runner.os == 'Windows'
+        shell: cmd
+        run: python wm811k_spc.py --demo --output spc_ci > log.txt
+
+      - if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spc_ci-py${{ matrix.python-version }}
+          path: spc_ci/
+          if-no-files-found: error

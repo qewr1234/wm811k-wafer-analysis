@@ -24,6 +24,13 @@
 #   - 임계값 탐색과 트리 깊이 선택 모두 train 안에서만 수행.
 #     트리 깊이는 train 내부 GroupKFold(lot)로 고른다.
 #   - test는 최종 1회만 사용.
+#   - 로트 분할은 wm811k_evaluate.py 와 같다: 제외(MIN_DIE 미만)되지 않은 웨이퍼의
+#     로트 목록(등장 순서)을 시드 42 로 30% 뽑는다. 두 스크립트의 test 로트가 같다.
+#
+# 사용법
+#   python wm811k_calibrate.py                   # data/wm811k_defects.pkl (또는 WM811K_DIR)
+#   python wm811k_calibrate.py path/to/file.pkl
+#   특징 캐시 wm811k_features.csv 가 스크립트 옆에 있으면 그것을 쓴다(다시 추출하지 않는다).
 
 from __future__ import annotations
 
@@ -43,9 +50,14 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 from wafer_map_visualizer import wafermap_to_df
 from wafer_pattern_classifier import classify_wafer_pattern
 
+if sys.platform == "win32":                      # Windows 파일/파이프 리다이렉트의 cp949 오류 방지
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("WM811K_DIR", HERE / "data"))   # 환경변수 또는 스크립트 옆 data/
 FEATURE_CACHE = HERE / "wm811k_features.csv"               # 실행 폴더와 무관하게 스크립트 옆에
+SPLIT_SEED, TEST_FRAC = 42, 0.3                            # wm811k_evaluate.lot_group_split 과 동일
 
 CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
            "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
@@ -253,10 +265,11 @@ def main(path: Path | None = None):
     F = build_features(path)
     print(f"\n특징 테이블 {len(F)}행 / 로트 {F['lot'].nunique()}개")
 
-    # 로트 단위 분할 — wm811k_evaluate.py와 동일한 시드
-    rng = np.random.default_rng(42)
-    lots = F["lot"].unique()
-    test_lots = set(rng.choice(lots, size=int(len(lots) * 0.3), replace=False))
+    # 로트 단위 분할 — wm811k_evaluate.lot_group_split 과 동일한 시드·로트 목록(제외 행 없음)
+    rng = np.random.default_rng(SPLIT_SEED)
+    lots = F["lot"].astype(str).unique()
+    test_lots = set(rng.choice(lots, size=int(len(lots) * TEST_FRAC), replace=False))
+    F["lot"] = F["lot"].astype(str)
     F["split"] = np.where(F["lot"].isin(test_lots), "test", "train")
     tr = F[F["split"] == "train"].reset_index(drop=True)
     te = F[F["split"] == "test"].reset_index(drop=True)
@@ -322,7 +335,7 @@ def main(path: Path | None = None):
         print(f"  {k:16s} {a:8.4f} {b:8.4f}")
 
     gap = results["랜덤포레스트"][1] - results["규칙(교정)"][1]
-    print(f"\n  랜덤포레스트 − 교정규칙 = {gap:+.4f}")
+    print(f"\n  랜덤포레스트 - 교정규칙 = {gap:+.4f}")
     if gap > 0.03:
         print("  → 규칙 구조가 정보를 잃고 있다. 수작업 규칙의 가치는")
         print("     성능이 아니라 해석 가능성으로 좁혀진다.")
@@ -347,4 +360,9 @@ def main(path: Path | None = None):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]) if len(sys.argv) > 1 else None)
+    import argparse
+
+    _ap = argparse.ArgumentParser(description="WM-811K 규칙 임계값 교정 (train 로트 전용) + 결정트리/RF 기준선")
+    _ap.add_argument("path", nargs="?", type=Path, default=None,
+                     help="pkl 경로 (기본: WM811K_DIR 또는 data/ 의 wm811k_defects.pkl)")
+    main(_ap.parse_args().path)

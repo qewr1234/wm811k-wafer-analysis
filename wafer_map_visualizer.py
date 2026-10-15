@@ -11,10 +11,21 @@
 #   [개선] 전역 np.random.seed → default_rng
 #   [개선] noise 파라미터 추가 (실제 데이터는 경계가 깨끗하지 않음)
 #   [개선] WM-811K 라벨에 맞춰 donut, edge_loc 패턴 추가
+#   [개선] 데모 저장 경로를 스크립트 폴더(HERE) 기준으로, plt.show() 는 --show 일 때만
+#          (배치·CI 에서 GUI 창이 떠서 멈추지 않게), Windows 콘솔 UTF-8 설정.
+#
+# 사용법
+#   MPLBACKEND=Agg python wafer_map_visualizer.py            # HERE/wafer_map_grid.png
+#   python wafer_map_visualizer.py --out other.png --show   # 경로 지정 + 창 표시
+#
+# 주의: 렌더·변환 함수(generate_sample_wafer_data, plot_wafer_map, wafermap_to_df,
+#       infer_geometry)의 본문은 README 실측 수치의 전제라 건드리지 않는다.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib.patches as mpatches
 import matplotlib.patheffects as pe
@@ -23,6 +34,8 @@ import numpy as np
 import pandas as pd
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Circle, Polygon, Rectangle
+
+HERE = Path(__file__).resolve().parent
 
 DEFECT_MODES = ("ring", "center", "scratch", "random", "donut", "edge_loc", "clean")
 
@@ -305,6 +318,18 @@ def wafermap_to_df(wmap: np.ndarray, die_size_mm: float = 10.0) -> pd.DataFrame:
 
 # ──────────────────────────────────────────
 if __name__ == "__main__":
+    import argparse
+
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
+    ap = argparse.ArgumentParser(description="합성 웨이퍼 맵 4모드 x noise 2종 그리드 렌더링 데모")
+    ap.add_argument("--out", type=Path, default=HERE / "wafer_map_grid.png",
+                    help="저장 경로 (기본: 스크립트 폴더의 wafer_map_grid.png)")
+    ap.add_argument("--show", action="store_true", help="저장 후 창으로도 표시 (기본: 저장만)")
+    args = ap.parse_args()
+
     # 노이즈 없는 버전과 있는 버전을 비교. 오른쪽이 실제 데이터에 가깝다.
     modes = ["ring", "center", "scratch", "donut"]
     fig, axes = plt.subplots(2, 4, figsize=(30, 16))
@@ -319,14 +344,16 @@ if __name__ == "__main__":
             )
 
     plt.tight_layout()
-    plt.savefig("wafer_map_grid.png", dpi=120, bbox_inches="tight")
-    print("저장 완료: wafer_map_grid.png")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(args.out, dpi=120, bbox_inches="tight")
+    print(f"저장 완료: {args.out}")
 
     # 200mm 웨이퍼에서도 동작하는지 확인 (원본은 여기서 불량 0개가 나왔다)
     df200 = generate_sample_wafer_data(wafer_diameter_mm=200.0, die_size_mm=8.0,
                                        defect_mode="ring")
     n_fail = (df200["status"] == "FAIL").sum()
     print(f"200mm 웨이퍼: 다이 {len(df200)}개, FAIL {n_fail}개 "
-          f"({'OK' if n_fail > 0 else 'FAILED — 임계값 확인 필요'})")
+          f"({'OK' if n_fail > 0 else 'FAILED - 임계값 확인 필요'})")
 
-    plt.show()
+    if args.show:
+        plt.show()
