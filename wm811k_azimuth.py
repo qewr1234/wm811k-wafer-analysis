@@ -2,7 +2,7 @@
 # 방위각 분석 - 로트 안에서 EDGE_LOC / LOC 의 위치가 노치 기준 같은 각도에 반복되는가
 #
 # 배경
-#   docs/defect_signatures.md 의 EDGE_LOC 점검과 현장 순서 3번은 "불량 호의 방위각을 노치
+#   docs/defect_signatures.md 의 EDGE_LOC 점검과 현장 순서 4번은 "불량 호의 방위각을 노치
 #   기준으로 재서, 같은 챔버를 거친 웨이퍼에서 같은 각도면 챔버 비대칭(배기구·가스구 방향),
 #   각도가 제각각이면 핸들링(로봇 센터링)·이벤트"라고 적고 있는데 그 계산이 코드에 없었다.
 #   이 모듈은 웨이퍼마다 최대 연결 성분의 무게중심 방위각을 재고, 로트 안에서 그 각도들이
@@ -25,6 +25,10 @@
 #   plot_azimuth_rose      노치 0도 로즈 다이어그램(matplotlib polar). 노치가 그림상 notch_deg
 #                          방향에 오도록 축을 돌려 plot_wafer_map 과 같은 방향으로 보인다.
 #   load_records           pkl(waferMap, lotName, waferIndex, failureType) + 예측 CSV(y_pred) 결합.
+#   join_predictions       records + 예측 CSV 의 2단계 결합((lot, wafer_index) 키 -> 로트 안 행 순서).
+#                          wm811k_scratch_shape / wm811k_lot_report 도 이 함수로 결합한다(한 곳에서만).
+#   run / demo_records / main 은 wm811k_scratch_shape·wm811k_slot·wm811k_commonality 에도 같은 이름으로
+#   있지만 입력 형식과 출력이 다르다(모듈별 CLI 뼈대). 모듈 밖에서 부르려면 모듈명을 붙여 쓴다.
 #
 # 왜
 #   같은 패턴이라도 "어느 각도에" 나오는지가 장비 측 증거(배기구 위치, 로봇 티칭 로그)와
@@ -243,12 +247,106 @@ def label_column(df: pd.DataFrame) -> str:
     raise ValueError("y_pred 또는 y_true 열이 필요하다.")
 
 
-def load_records(path: Path, pred: Path | None = None) -> pd.DataFrame:
+PRED_COLS = ("y_pred", "confidence")
+
+
+def join_predictions(records: pd.DataFrame, preds: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """records(waferMap, lot, wafer_index ...) 에 예측(lot, y_pred, 선택 wafer_index/confidence)을 붙인다.
+
+    wm811k_azimuth.load_records 와 wm811k_lot_report._lot_frame 이 같이 쓰는 2단계 결합이다.
+      1단계 (lot, wafer_index) 키: 양쪽 모두 wafer_index 가 있는 행끼리 merge (예측 쪽 중복 키는 첫 행).
+      2단계 로트 안 행 순서: 1단계에서 남은 records 행과 아직 쓰이지 않은 예측 행의 수가 로트 안에서
+              같을 때만 순서대로 채운다 (wafer_index 가 한쪽 또는 양쪽에 없거나 결측인 경우).
+    어느 로트도 결합되지 않으면 ValueError (결측 장수와 행 수를 문구에 적는다). 일부만 결합되면 그
+    사실을 info 로 돌려주고 호출자가 알린다 - 조용히 버리지 않는다.
+
+    반환 (df, info): df 는 records 의 열 + y_pred, confidence (결합 안 된 행은 NaN, 행 순서 유지).
+    info = {n_records, n_preds, n_keyed, n_ordered, n_unmatched, n_pred_unused, n_rec_key_na, n_pred_key_na,
+            lots_unmatched(결합된 행이 하나도 없는 로트 목록)}.
+    """
+    for c in ("lot", "y_pred"):
+        if c not in preds.columns:
+            raise ValueError(f"예측에 lot, y_pred 열이 필요하다. 열: {list(preds.columns)}")
+    if "lot" not in records.columns:
+        raise ValueError("records 에 lot 열이 필요하다.")
+    keep = [c for c in PRED_COLS if c in preds.columns]
+    out = records.drop(columns=[c for c in PRED_COLS if c in records.columns]).reset_index(drop=True)
+    out["lot"] = out["lot"].astype(str)
+    rec_key = (pd.to_numeric(out["wafer_index"], errors="coerce") if "wafer_index" in out.columns
+               else pd.Series(np.nan, index=out.index, dtype=float))
+    p = preds.reset_index(drop=True).copy()
+    p["lot"] = p["lot"].astype(str)
+    p_key = (pd.to_numeric(p["wafer_index"], errors="coerce") if "wafer_index" in p.columns
+             else pd.Series(np.nan, index=p.index, dtype=float))
+    out["y_pred"] = pd.Series([np.nan] * len(out), index=out.index, dtype=object)
+    out["confidence"] = np.nan
+    lots = out["lot"].to_numpy()
+    p_lots = p["lot"].to_numpy()
+    # 1단계: (lot, wafer_index) 키. records 쪽 같은 키가 여러 행이면 첫 행만 받는다.
+    rec_pos: dict[tuple[str, float], int] = {}
+    for i in np.flatnonzero(rec_key.notna().to_numpy()):
+        rec_pos.setdefault((lots[i], float(rec_key.iat[i])), int(i))
+    matched = np.zeros(len(out), dtype=bool)
+    used_p = np.zeros(len(p), dtype=bool)
+    n_keyed = 0
+    for j in np.flatnonzero(p_key.notna().to_numpy()):
+        i = rec_pos.pop((p_lots[j], float(p_key.iat[j])), None)
+        if i is None:
+            continue
+        for c in keep:
+            out.at[i, c] = p.at[j, c]
+        matched[i] = True
+        used_p[j] = True
+        n_keyed += 1
+    # 2단계: 로트 안 행 순서. 남은 records 행 수 == 아직 안 쓴 예측 행 수이고, 어느 한쪽이 키를 전부
+    # 갖지 않을 때만. 양쪽 다 키가 있는데 안 맞는 경우(예: 0/1 기준 어긋남)는 순서로 덮지 않고 결합 실패로 남긴다.
+    n_ordered = 0
+    for lot, idx in out.groupby("lot", sort=False).indices.items():
+        rem = [int(i) for i in idx if not matched[i]]
+        pj = [int(j) for j in np.flatnonzero((p_lots == lot) & ~used_p)]
+        keyless = rec_key.iloc[rem].isna().all() or p_key.iloc[pj].isna().all() if rem and pj else False
+        if rem and len(rem) == len(pj) and keyless:
+            for i, j in zip(rem, pj):
+                for c in keep:
+                    out.at[i, c] = p.at[j, c]
+                matched[i] = True
+                used_p[j] = True
+            n_ordered += len(rem)
+    lots_unmatched = sorted(L for L, idx in out.groupby("lot", sort=False).indices.items()
+                            if not matched[idx].any())
+    info = {"n_records": int(len(out)), "n_preds": int(len(p)), "n_keyed": int(n_keyed),
+            "n_ordered": int(n_ordered), "n_unmatched": int((~matched).sum()),
+            "n_pred_unused": int((~used_p).sum()), "n_rec_key_na": int(rec_key.isna().sum()),
+            "n_pred_key_na": int(p_key.isna().sum()), "lots_unmatched": lots_unmatched}
+    if n_keyed + n_ordered == 0:
+        raise ValueError("예측 CSV 를 결합할 수 없다: (lot, wafer_index) 키로 맞는 행이 없고 "
+                         f"(wafer_index 결측: records {info['n_rec_key_na']}장, 예측 {info['n_pred_key_na']}행) "
+                         f"로트 안 행 수도 다르다 (예측 {len(p)} vs records {len(out)}).")
+    out["confidence"] = pd.to_numeric(out["confidence"], errors="coerce")
+    return out, info
+
+
+def join_note(info: dict) -> str:
+    """join_predictions 의 info 를 한 줄 주의 문구로. 전부 키로 결합됐고 남는 행이 없으면 ''.
+    (순서 결합은 '같은 순서'라는 가정이므로 한 장이라도 있으면 알린다.)"""
+    if info["n_unmatched"] == 0 and info["n_pred_unused"] == 0 and info["n_ordered"] == 0:
+        return ""
+    parts = [f"키 결합 {info['n_keyed']}장, 순서 결합 {info['n_ordered']}장"]
+    if info["n_unmatched"]:
+        parts.append(f"예측 없는 records {info['n_unmatched']}장 제외")
+    if info["n_pred_unused"]:
+        parts.append(f"records 에 없는 예측 {info['n_pred_unused']}행 무시")
+    if info["n_rec_key_na"] or info["n_pred_key_na"]:
+        parts.append(f"wafer_index 결측 records {info['n_rec_key_na']}장 / 예측 {info['n_pred_key_na']}행")
+    return "[주의] 예측 결합: " + ", ".join(parts)
+
+
+def load_records(path: Path, pred: Path | None = None, verbose: bool = True) -> pd.DataFrame:
     """pkl(LSWMD 형식 또는 prepare_wm811k 출력) 을 읽고, 있으면 예측 CSV 의 y_pred 를 붙인다.
 
     반환 열: waferMap, lot, wafer_index, y_true, (y_pred, confidence).
-    예측 CSV 와의 결합은 양쪽에 wafer_index 가 있으면 (lot, wafer_index) 키, 없으면 행 수가 같을
-    때 행 순서. 어느 쪽도 안 되면 ValueError.
+    예측 CSV 와의 결합은 join_predictions (키 결합 뒤 로트 안 행 순서 결합). 일부만 결합되면
+    verbose 일 때 join_note 를 출력하고, 예측이 붙지 않은 행은 제외한다.
     """
     df = pd.read_pickle(path)
     if "waferMap" not in df.columns:
@@ -274,19 +372,13 @@ def load_records(path: Path, pred: Path | None = None) -> pd.DataFrame:
         p = pd.read_csv(pred)
         if "y_pred" not in p.columns or "lot" not in p.columns:
             raise ValueError(f"{pred.name}: lot, y_pred 열이 필요하다.")
-        p["lot"] = p["lot"].astype(str)
-        keep = [c for c in ("y_pred", "confidence") if c in p.columns]
-        if "wafer_index" in p.columns and out["wafer_index"].notna().all():
-            p["wafer_index"] = pd.to_numeric(p["wafer_index"], errors="coerce")
-            p = p.drop_duplicates(["lot", "wafer_index"])
-            out = out.merge(p[["lot", "wafer_index"] + keep], on=["lot", "wafer_index"], how="left")
-        elif len(p) == len(out):
-            for c in keep:
-                out[c] = p[c].to_numpy()
-        else:
-            raise ValueError("예측 CSV 를 결합할 수 없다: wafer_index 가 없고 행 수도 다르다 "
-                             f"({len(p)} vs {len(out)}).")
+        out, info = join_predictions(out, p)
+        note = join_note(info)
+        if note and verbose:
+            print(note)
         out = out[out["y_pred"].notna()].reset_index(drop=True)
+        if "confidence" in out.columns and out["confidence"].isna().all() and "confidence" not in p.columns:
+            out = out.drop(columns="confidence")
     return out
 
 

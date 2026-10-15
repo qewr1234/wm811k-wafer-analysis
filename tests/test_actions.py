@@ -11,7 +11,9 @@
 #   - ACTIONS == {k: v['summary']} (기존 import 호환)
 #   - 모든 문자열이 cp949 로 인코딩 가능(Windows 콘솔·파일 리다이렉트)
 #   - docs/defect_signatures.md 에 결함 8종 헤더가 있음(문서-코드 키 일치)
-#   - plotly_wafer_heatmap.py 가 --cdn 없이 만든 HTML 은 CDN <script src> 를 쓰지 않음
+#   - plotly_wafer_heatmap.py 가 --cdn 없이 만든 HTML 은 CDN <script src> 를 쓰지 않음,
+#     콘솔 요약의 수율 == HTML 제목의 수율(같은 시드), --demo 와 --csv 동시 지정은 사용법 오류
+#   - EDGE_RING 점검 항목에서 매엽 성막과 배치 퍼니스가 구분되고, 엣지 보정값 서술에 '사양 확인' 표시
 
 from __future__ import annotations
 
@@ -82,7 +84,7 @@ def test_physics_corrections_applied():
 
     sc = " ".join(ACTION_DETAIL["SCRATCH"]["first_checks"])
     assert "호" in sc and "직선" in sc
-    assert "프로브 카드는 선형 스크래치를 만들지 않는다" in sc
+    assert "정상 터치다운은 선형 스크래치를 만들지 않는다" in sc and "격자 축" in sc
 
     assert "Edge exclusion" not in ACTION_DETAIL["EDGE_RING"]["summary"]
     assert not any("Edge exclusion" in s for _, s in _all_strings(ACTION_DETAIL["EDGE_RING"]))
@@ -101,6 +103,17 @@ def test_physics_corrections_applied():
     ce = " ".join(ACTION_DETAIL["CENTER"]["first_checks"])
     assert "'중심 누설'은 보지 않는다" in ce            # He 누설은 엣지 실 밴드·리프트 핀 홀
     assert "He 백사이드 중심 누설" not in ce
+
+    # EDGE_RING: 매엽 성막(Triase+ / Episode / NT333)과 배치 퍼니스(TELINDY PLUS)는 점검 항목이 다르다
+    # (퍼니스는 존이 보트 축 방향, 센터/엣지 가스 분배비 개념이 없다). tel_modules 와 같은 구분이어야 한다.
+    er = ACTION_DETAIL["EDGE_RING"]
+    dep = [s for s in er["first_checks"] if "성막" in s]
+    assert len(dep) == 1 and "NT333 성막" in dep[0] and "TELINDY PLUS 퍼니스" in dep[0], dep
+    assert not any("TELINDY PLUS 성막" in s for _, s in _all_strings(er))
+    assert "슬롯" in dep[0] and "가스 분배비" in dep[0].split("TELINDY")[0]
+    # 엣지 보정값(링 높이·엣지 DC 바이어스)은 공개 특허 수준이지 TEL 제품 사양이 아니다 - 그 표시가 있어야 한다
+    corr = [s for _, s in _all_strings(er) if "DC 바이어스" in s]
+    assert corr and all("사양" in s for s in corr), corr
 
 
 def test_tel_product_names_current():
@@ -153,6 +166,31 @@ def test_cli_actions_runs():
 
 
 CDN_SCRIPT = re.compile(r'<script[^>]+src="https?://cdn\.plot\.ly[^"]*"')
+YIELD_RE = re.compile(r"Yield\s+([0-9.]+)%")
+
+
+def test_plotly_console_matches_html(tmp_path):
+    """콘솔 요약의 수율은 HTML 서브플롯 제목의 수율과 같아야 한다(같은 시드로 같은 맵을 써야 한다).
+    이전에는 콘솔이 기본 시드로 다시 생성해 center 93.7% vs 93.2% 처럼 어긋났다."""
+    out = tmp_path / "demo.html"
+    r = subprocess.run([sys.executable, str(ROOT / "plotly_wafer_heatmap.py"), "--cdn", "--out", str(out)],
+                       capture_output=True, text=True, encoding="utf-8", cwd=tmp_path)
+    assert r.returncode == 0, r.stderr
+    console = YIELD_RE.findall(r.stdout)
+    html = YIELD_RE.findall(out.read_text(encoding="utf-8"))
+    assert len(console) == 6 and console == html, (console, html)
+
+    from plotly_wafer_heatmap import _demo_wafers, resolve_fields
+    wafers = _demo_wafers()
+    assert [w["seed"] for w in wafers] == [2024 + i for i in range(6)]       # 시드가 명시돼 있다
+    a = [f.yield_pct for f in resolve_fields(wafers)]
+    b = [f.yield_pct for f in resolve_fields([{k: v for k, v in w.items() if k != "seed"} for w in wafers])]
+    assert a == b                                                             # 명시 시드 == 기본 시드 규칙(2024 + i)
+
+    # --demo 와 --csv 를 같이 주면 사용법 오류
+    r = subprocess.run([sys.executable, str(ROOT / "plotly_wafer_heatmap.py"), "--demo", "--csv", "x.csv"],
+                       capture_output=True, text=True, encoding="utf-8", cwd=tmp_path)
+    assert r.returncode == 2 and "--demo" in r.stderr
 
 
 def test_plotly_html_is_self_contained_by_default(tmp_path):

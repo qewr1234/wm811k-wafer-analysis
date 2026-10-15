@@ -10,7 +10,9 @@ spc/
 spc_ci/
 slot_ci/
 commonality_ci/
+*_ci/
 log.txt
+log_*.txt
 # 현장 분석 스크립트의 기본 출력 폴더 (--output 미지정 시 스크립트 옆에 생긴다)
 azimuth_out/
 azimuth_demo/
@@ -40,3 +42,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+*.egg-info/

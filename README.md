@@ -2,16 +2,7 @@
 
 실측 웨이퍼 맵 25,519장(WM-811K)에서 결함 패턴 8종을 판별하고(macro-F1 0.907 ± 0.008, 로트 분할 5회), 각 패턴을 TEL 장비 모듈의 점검 순서·장비 측 증거·타사 인계 기준에 연결하고, 판정 위에 SPC 관리도를 붙여 추세의 시작점을 찾는 도구. 장비사 기술지원 엔지니어 시점으로 쓴 포트폴리오다. English: [`docs/README_en.md`](docs/README_en.md).
 
-## Summary (EN)
-
-- **Problem.** A die-level pass/fail wafer map is the accumulated result of every process step. An equipment vendor's technical support engineer sees such a map only when the customer escalates, and must narrow "is it our tool, or a hand-off to another vendor's tool?" with tool-side evidence (alarm logs, part counters, PM history) rather than the map alone.
-- **Data.** WM-811K (Wu, Jang & Chen 2015): 25,519 labeled defect wafers in 8 classes, 8,047 lots, 329 map sizes (lot and size counts computed here). The 2 GB source file is not committed; 'none' (normal) wafers are excluded.
-- **Method.** 20 interpretable features: 6 global radial/angular statistics, 11 structural (connected components, angular coverage, radial profile), 3 largest-component position features, plus a random forest. Lot-level group split repeated over 5 seeds; thresholds tuned on train lots only; macro-F1 over the 8 defect classes.
-- **Result.** Rule-based 0.167 (uncalibrated) → 0.558 (calibrated) → RF 0.907 ± 0.008 (train 0.99). Per-class F1 from 0.83 (SCRATCH) to 0.98 (EDGE_RING, NEAR_FULL). The synthetic self-check (7/7) is a coding check, not a performance number.
-- **What the diagnosis showed.** The synthetic-to-real collapse was a threshold problem, not a feature problem (single-feature AUCs were already high); thin scratches needed connected-component features; the remaining EDGE_LOC/LOC confusion needed largest-component position; one design assumption (RANDOM = many small components) was wrong and is recorded as such.
-- **SPC.** Per-pattern p-charts on the classifier output with Laney p' overdispersion correction, Western Electric rules, EWMA and Phase I/II limits, stratified by chamber/slot (`--group-col`) and overlaid with PM/part-replacement events (`--event-col`). Rising alarms are attached to the per-pattern check list. Demo only: WM-811K rows are not in time order.
-- **Field modules.** A per-pattern action playbook (`ACTION_DETAIL`: first checks, what to rule out first, customer-side vs tool-side evidence, TEL modules, hand-off to non-TEL tools), lot-level azimuth / scratch-shape / slot / tool-commonality analyses, a lot troubleshooting PDF and a service-report PDF. All verified on synthetic data only (logic, not performance).
-- **Limits.** WM-811K has no timestamps, tool/chamber IDs, slot or probe-site information; notch orientation is an assumption; the defect subset averages 3.2 wafers per lot, so most lot-level tests return "insufficient"; equipment descriptions are public-source level and TEL internals or PM intervals are unknown.
+**Summary (EN).** 25,519 real wafer maps (WM-811K), 8 defect classes, 20 interpretable features + random forest, lot-level split × 5 seeds: macro-F1 0.167 (rules, uncalibrated) → 0.558 (calibrated) → **0.907 ± 0.008**. On top of the classifier: a per-pattern action playbook (first checks, customer-side vs tool-side evidence, TEL modules, hand-off to non-TEL tools), lot-level azimuth / scratch-shape / slot / tool-commonality analyses, SPC p-charts (Laney p′, Western Electric, EWMA, `--group-col`, `--event-col`) and service / lot-report PDFs — all verified on synthetic data only (logic, not performance). WM-811K has no timestamps, tool/chamber IDs or slots, and equipment descriptions are public-source level.
 
 ![흐름도: 맵 → 판정 → 의심 모듈·점검 순서 → SPC 추세 → 보고서](docs/img/pipeline.svg)
 
@@ -19,20 +10,23 @@
 
 ## 직무와의 연결
 
-2026 하반기 공채 직무명 **Software Engineer - Tech Support Engineer** 기준으로 쓴다. 경력 Field / Process Engineer 트랙에서도 같은 표로 읽히도록 두 관점으로 나눴다. 1인 프로젝트이며 협업 구조는 공개 자료 기준의 설계다([`docs/handoff.md`](docs/handoff.md)).
-<!-- 공고의 담당업무 문장은 소유자가 원문을 확인한 뒤 docs/references.md D절에 인용·확인일을 적고 아래 행에 1:1로 연결할 것. 원문 확인 전에는 인용하지 않는다. -->
+지원 트랙은 Tokyo Electron Korea 2026 하반기 공채의 **채용연계형 인턴** 직무 **Software Engineer - Tech Support Engineer**(화성 동탄, 6개월 후 전환 평가; 2026-10-15 확인, [`docs/references.md`](docs/references.md) [47])다. 같은 공채의 경력 트랙은 Field / Process Engineer(장비 실무 요건)뿐이라 지원 대상이 아니며, 아래 표의 '현장 기술지원 관점' 열은 그 FE/PE 와 협업하는 기술지원 소프트웨어 엔지니어의 시점이다. 1인 프로젝트이며 협업 구조는 공개 자료 기준의 설계다([`docs/handoff.md`](docs/handoff.md)).
+
+업무 열은 공개된 FE/PE 공고 문구([`docs/references.md`](docs/references.md) [53][54]) 기준이다. 지원 직무의 담당업무는 공고 이미지로만 공개돼 인용하지 않았다.
 
 | 업무 | 현장 기술지원 관점 | 설비 데이터·소프트웨어 관점 |
 |---|---|---|
 | 트러블슈팅 절차 | [`docs/defect_signatures.md`](docs/defect_signatures.md) 패턴별 점검 순서·고객 측/장비 측 증거·인계 판정, `python wafer_pattern_classifier.py --actions <PATTERN>`, [`docs/process_context.md`](docs/process_context.md) 서브시스템·안전 체크 | `wm811k_lot_report.py`(로트 판정·의심 모듈 순위·OCAP 레벨), `wm811k_azimuth.py` / `wm811k_scratch_shape.py` / `wm811k_slot.py` |
-| 보고서·작업지시서 | `batch_wafer_report.py` 서비스 리포트 양식([`docs/img/service_report_page.png`](docs/img/service_report_page.png)), 보고 3단계([`docs/handoff.md`](docs/handoff.md)), 8D 케이스 2건([`docs/case_study_8d.md`](docs/case_study_8d.md)) | `wm811k_spc.py`의 알람 요약 `spc_<stem>_report.md`, `wm811k_lot_report.py` PDF + JSON, 두 리포트의 `--anonymize` |
+| 보고서 | `batch_wafer_report.py` 서비스 리포트 양식([`docs/img/service_report_page.png`](docs/img/service_report_page.png)), 보고 3단계([`docs/handoff.md`](docs/handoff.md)), 8D 케이스 2건([`docs/case_study_8d.md`](docs/case_study_8d.md)) | `wm811k_spc.py`의 알람 요약 `spc_<stem>_report.md`, `wm811k_lot_report.py` PDF + JSON, 두 리포트의 `--anonymize` |
 | 추세 감시·예방보전 | 상승 알람 → 점검 항목·대조할 장비 측 로그, SEMI E10 관점(비예정 정지 → 예정 정지)([`docs/spc.md`](docs/spc.md)) | `wm811k_spc.py`: Laney p′, Western Electric 4규칙, EWMA, `--group-col`, `--event-col`, 저신뢰 관리도(모델 감시) |
-| 본사·해외 협업·인계 | TEL 원인 vs 타사 인계 기준, 8D 팀 역할([`docs/handoff.md`](docs/handoff.md)), 한/영/일 용어 대조([`docs/glossary.md`](docs/glossary.md)) | [`docs/README_en.md`](docs/README_en.md), 리포트 `--lang en`, 장비 측 데이터(TELeMetrics·Ingenio 쪽)와의 결합 키([`docs/tel_equipment_map.md`](docs/tel_equipment_map.md) 3절) |
+| 본사·해외 협업·인계 | TEL 원인 vs 타사 인계 기준, 8D 팀 역할([`docs/handoff.md`](docs/handoff.md)), 한/영/일 용어 대조([`docs/glossary.md`](docs/glossary.md)) | [`docs/README_en.md`](docs/README_en.md), 리포트 `--lang en`(양식·요약·축 라벨만 영문이고 조치 문구는 한글 단일 소스 — 영문 조치 문구는 README_en §5 표), 장비 측 데이터(TELeMetrics·Ingenio 쪽)와의 결합 키([`docs/tel_equipment_map.md`](docs/tel_equipment_map.md) 3절) |
 | 설비 개선·자동화 | 검증 범위와 남은 항목([`docs/roadmap.md`](docs/roadmap.md)), `make_figures.py` 한 명령으로 산출물 재생성 | `tests/` 13개 파일(합성만) + CI 매트릭스(ubuntu/windows × Python 3.11/3.12), 특징값 스냅샷(수치 불변 감시), `wm811k_commonality.py` + [`docs/lot_history_schema.md`](docs/lot_history_schema.md) |
 
 ## 맵 한 장이 들어왔을 때
 
 [`docs/defect_signatures.md`](docs/defect_signatures.md)의 현장 순서와 같다. 3~7단계는 WM-811K에 시각·챔버·슬롯·장비 이력이 없어 합성 데이터(`--demo`)로 로직만 확인했다.
+
+![합성 웨이퍼 맵 8종(CENTER, DONUT, EDGE_LOC, EDGE_RING, LOC, NEAR_FULL, RANDOM, SCRATCH) 2x4 격자. 노치는 아래(가정).](docs/img/wafer_patterns_synthetic.png)
 
 1. **에스컬레이션 수신·맵 판정.** 빈 맵, 로트 이력(어느 TEL 챔버를 언제 거쳤는가), 재테스트 여부를 받는다. 플레이북: `python wafer_pattern_classifier.py --actions EDGE_RING`, 로트 묶음 리포트: `python batch_wafer_report.py --anonymize`.
 2. **테스트 원인 배제.** NEAR_FULL과 격자 주기 반복 패턴은 프로브 카드·테스트 프로그램이 만들 수 있다. 재테스트가 가장 싸다(`--actions NEAR_FULL`의 rule_out_first). 프로버가 Precio / Prexa면 TEL 프로버 점검이 함께 간다.
@@ -42,6 +36,16 @@
 6. **공통성 분석.** 불량 로트들이 공유한 장비·챔버: `python wm811k_commonality.py test_predictions.csv --history lot_history.csv --pattern EDGE_LOC` (`--demo`).
 7. **언제부터인가.** 패턴 발생률 관리도에 부품 교체·PM 이벤트를 겹친다: `python wm811k_spc.py test_predictions.csv --time-col <t> --event-col <event> --group-col chamber` (`--demo`). 시작점이 이벤트와 겹치면 그것이 답이다.
 8. **TEL 원인 / 타사 인계 판정 → 보고.** `ACTION_DETAIL[pattern]["handoff"]` 기준으로 판정하고 초동 → 중간 → 종결 보고([`docs/handoff.md`](docs/handoff.md)). 끝까지 수행한 합성 사례: [`docs/case_study_8d.md`](docs/case_study_8d.md).
+
+7단계의 관리도(합성 데모, 챔버 층화 + PM·부품 교체 이벤트 세로선; B 챔버에만 심은 EDGE_RING 드리프트·저신뢰 증가·SCRATCH 계단):
+
+![챔버별로 층화한 패턴 발생률 관리도. B 챔버의 EDGE_RING 발생률이 웨이퍼 3000 이후 상승하고 pm_wet_clean·focus_ring_replaced 이벤트가 세로 점선으로 겹쳐 있다.](docs/img/spc_demo_chamber.png)
+
+8단계의 산출물(합성 데이터, Tool/Chamber 는 빈 양식):
+
+| 서비스 리포트 1페이지 (`batch_wafer_report.py`) | 로트 트러블슈팅 리포트 1페이지 (`wm811k_lot_report.py --demo`) |
+|---|---|
+| ![서비스 리포트 양식: 로트 요약, 패턴 판정, 심각도, 점검 순서, 장비 측 증거, 수집 데이터, 체크리스트](docs/img/service_report_page.png) | ![로트 리포트: 패턴 믹스, 로트 내 반복, 방위각, 스크래치 모양, 슬롯, 의심 모듈 순위, OCAP 레벨](docs/img/lot_report_page.png) |
 
 ## 결과 요약
 
@@ -63,7 +67,7 @@
 | `wm811k_structural.py` | 구조 특징 11개(연결 성분·각도 커버리지·반경 프로파일) 추가와 비교 |
 | `wm811k_validate.py` | 로트 분할 5회 반복 검증, 위치 특징 3개, RF 규제 선택. `--export-predictions` → `test_predictions.csv` |
 | `wm811k_improve.py` | 강건 특징 8개 + HistGradientBoosting, 같은 5분할에서 짝지어 비교(실측 미측정) |
-| `wm811k_spc.py` | 분류 결과 위 SPC: 패턴별 p 관리도(Laney), 저신뢰 관리도, WE 규칙, EWMA, `--group-col` / `--event-col` / `--anonymize` / `--lang`, 알람 요약 md |
+| `wm811k_spc.py` | 분류 결과 위 SPC: 패턴별 p 관리도(Laney), 저신뢰 관리도, WE 규칙, EWMA, `--group-col` / `--event-col` / `--anonymize`(`--anon-key-env`) / `--lang`, 알람 요약 md |
 | `wm811k_azimuth.py` | 로트 안 EDGE_LOC/LOC 위치가 노치 기준 같은 각도인가(Rayleigh, 순열 p). `--notch-deg` |
 | `wm811k_scratch_shape.py` | 스크래치 직선/호 판별(직선·원 적합)과 로트 내 방향 재현성 |
 | `wm811k_slot.py` | 슬롯(waferIndex 대리) 의존성: 끝 슬롯 2×2, 로트 층화 순열, Spearman |
@@ -107,19 +111,22 @@
 
 ## 실행
 
-Python ≥ 3.10 (CI는 3.11/3.12). Windows는 각 스크립트가 콘솔·파일 리다이렉트를 UTF-8로 자동 설정하고, 한글 폰트는 `docs/fonts/`에 동봉돼 있어 설치가 필요 없다. 데이터 경로는 `WM811K_DIR`, 산출물은 스크립트 옆에 생기며 `.gitignore`로 제외된다.
+Python 3.11 / 3.12(CI 검증 범위; 3.10 이하는 미검증). Windows는 각 스크립트가 콘솔·파일 리다이렉트를 UTF-8로 자동 설정하고, 한글 폰트는 `docs/fonts/`에 동봉돼 있어 설치가 필요 없다. 데이터 경로는 `WM811K_DIR`, 산출물은 스크립트 옆에 생기며 `.gitignore`로 제외된다.
 
 ```bash
 pip install -r requirements-dev.txt
-# ① 데이터 없이 5분 — 전부 합성 (로직 확인이지 성능이 아니다)
+# ① 데이터 없이 5분 안팎 (4코어 기준) — 전부 합성 (로직 확인이지 성능이 아니다)
 python wafer_pattern_classifier.py                                   # 합성 7모드 자체 검증 7/7, 실패 시 종료 코드 1
-python -m pytest -q                                                  # tests/ 전체 (약 2분)
+python -m pytest -q                                                  # tests/ 전체 174개 (4코어 약 2~3분; 가장 긴 test_pipeline_end_to_end 약 1분)
 python batch_wafer_report.py --anonymize                             # 배치 PDF + 서비스 리포트 양식
 python wm811k_spc.py --demo --group-col chamber --event-col event    # 관리도 PNG·알람 CSV·알람 요약 md (spc/)
 python wm811k_lot_report.py --demo                                   # 로트 트러블슈팅 리포트 PDF + JSON
-python wm811k_azimuth.py --demo && python wm811k_scratch_shape.py --demo && python wm811k_slot.py --demo && python wm811k_commonality.py --demo
+python wm811k_azimuth.py --demo                                      # 로트 안 방위각 (한 줄씩 — Windows PowerShell 5.x 는 && 미지원)
+python wm811k_scratch_shape.py --demo                                # 스크래치 직선/호
+python wm811k_slot.py --demo                                         # 슬롯 의존성
+python wm811k_commonality.py --demo                                  # 장비·챔버 공통성
 python make_figures.py                                               # docs/img, docs/samples 재생성
-# ② 실측 — data/LSWMD.pkl (약 2GB, data/README.md) 필요. 시간은 4코어 기준 추정
+# ② 실측 — data/LSWMD.pkl (약 2 GB, data/README.md) 필요. 시간은 4코어 기준 추정
 python prepare_wm811k.py                                             # → data/wm811k_defects.pkl (수 분)
 python wm811k_evaluate.py                                            # 미교정 규칙 0.167, wm811k_predictions.csv (특징 추출 ~2분)
 python wm811k_calibrate.py                                           # 교정 0.558 + 트리 비교 (수 분)

@@ -3,7 +3,7 @@
 #
 # 배경
 #   수율 이상이 나면 팹에서 가장 먼저 하는 일은 "불량 로트들이 어느 장비를 같이 지났는가"를
-#   로트 이력에서 찾는 것이다(docs/defect_signatures.md 현장 순서 4번). 장비사 기술지원
+#   로트 이력에서 찾는 것이다(docs/defect_signatures.md 현장 순서 6번). 장비사 기술지원
 #   엔지니어 입장에서는 이 결과가 "우리 장비(TEL 모듈)가 지목됐는가, 타사 장비 인계인가"를
 #   가르는 첫 근거이고, 지목된 장비·챔버의 PM·부품 교체 이력을 그 다음에 맞댄다.
 #   WM-811K 에는 장비 이력이 없다. 그래서 입력 스키마(docs/lot_history_schema.md)를 정하고
@@ -21,6 +21,9 @@
 #   synthetic_predictions 그 이력과 맞는 합성 예측 (planted 장비를 지난 로트에 패턴 비율을 높인다).
 #   plot_commonality     단위별 양성률 가로 막대 + CI (유의/불충분 색 구분, 영문 라벨).
 #   CLI                  predictions.csv --history lot_history.csv --pattern EDGE_LOC --output DIR / --demo
+#                        --anonymize 는 이력·예측의 lot / tool / chamber 를 키드 해시로 바꿔(wm811k_spc.anonymize_ids,
+#                        매핑 표 미저장) 표·요약·그림에 실제 장비 ID 가 남지 않게 한다.
+#   run / run_demo / _format_summary 는 wm811k_slot 등에도 같은 이름으로 있지만 입력 형식이 다르다(모듈별 CLI 뼈대).
 #
 # 왜 이렇게
 #   - 단위는 로트다. 같은 로트의 웨이퍼는 패턴을 공유하므로 웨이퍼를 세면 과산포로 p 가 과장된다.
@@ -50,6 +53,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -58,6 +62,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import fisher_exact
+
+from wm811k_spc import anonymize_ids
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -468,11 +474,35 @@ def _format_summary(tab: pd.DataFrame, status: pd.Series, history: pd.DataFrame,
     return lines
 
 
+ANON_COLS = ("lot", "tool", "chamber")
+
+
+def anonymize_inputs(preds: pd.DataFrame, history: pd.DataFrame, salt: bytes | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """예측·이력의 lot / tool / chamber 를 같은 salt 의 키드 해시로 바꾼다 (wm811k_spc.anonymize_ids).
+    같은 값은 양쪽에서 같은 해시가 되므로 결합은 그대로 되고, 매핑 표는 저장하지 않는다."""
+    salt = os.urandom(8) if salt is None else salt
+    h = history.copy()
+    if "chamber" in h.columns:                       # 빈 챔버('')는 빈 값으로 둔다
+        blank = h["chamber"].astype(str).str.strip() == ""
+        h = anonymize_ids(h, [c for c in ANON_COLS if c in h.columns], salt)
+        h.loc[blank, "chamber"] = ""
+    else:
+        h = anonymize_ids(h, [c for c in ANON_COLS if c in h.columns], salt)
+    return anonymize_ids(preds, ["lot"], salt), h
+
+
 def run(preds: pd.DataFrame, history: pd.DataFrame, pattern: str, out_dir: Path, by=DEFAULT_BY,
         min_frac: float = DEFAULT_MIN_FRAC, min_n: int = DEFAULT_MIN_N, min_lots: int = DEFAULT_MIN_LOTS,
-        label: str = "") -> dict:
-    """상태 -> 표 -> 요약 -> 그림. out_dir 에 저장하고 dict(status, table) 를 돌려준다."""
+        label: str = "", anonymize: bool = False, salt: bytes | None = None) -> dict:
+    """상태 -> 표 -> 요약 -> 그림. out_dir 에 저장하고 dict(status, table) 를 돌려준다.
+
+    anonymize 면 먼저 anonymize_inputs 로 lot / tool / chamber 를 해시로 바꾸고 그 뒤는 똑같이 돈다.
+    이력과 예측의 로트가 하나도 겹치지 않으면 commonality_table 의 ValueError 가 그대로 올라온다(main 이 sys.exit).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+    if anonymize:
+        preds, history = anonymize_inputs(preds, history, salt)
+        label = f"{label or 'predictions'} (ids anonymized)"
     status = lot_pattern_status(preds, pattern, min_frac, min_n)
     missing = set(status.index.astype(str)) - set(history["lot"].astype(str))
     if missing:
@@ -533,6 +563,8 @@ def _cli(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--min-n", type=int, default=DEFAULT_MIN_N, help="로트 양성 판정에 필요한 최소 장수 (기본 1; 팹 데이터는 5 권장)")
     ap.add_argument("--min-lots", type=int, default=DEFAULT_MIN_LOTS, help="이보다 적은 로트를 지난 단위는 근거 부족 (기본 5)")
     ap.add_argument("--output", type=Path, default=None, help="출력 폴더 (기본 HERE/commonality_out, --demo 는 HERE/commonality_demo)")
+    ap.add_argument("--anonymize", action="store_true",
+                    help="lot / tool / chamber 를 키드 해시로 치환해 출력 (매핑 표 미저장; docs/handoff.md 4절)")
     ap.add_argument("--demo", action="store_true", help="합성 이력으로 로직 확인 (성능 아님)")
     return ap.parse_args(argv)
 
@@ -545,10 +577,13 @@ def main(argv: list[str] | None = None) -> dict | None:
         return None
     if a.predictions is None or a.history is None:
         sys.exit("예측 CSV 와 --history 이력 CSV 가 필요하다 (또는 --demo).")
-    preds = pd.read_csv(a.predictions)
-    history = load_lot_history(a.history)
-    return run(preds, history, a.pattern, a.output or HERE / "commonality_out", tuple(a.by),
-               a.min_frac, a.min_n, a.min_lots, label=a.predictions.name)
+    try:
+        preds = pd.read_csv(a.predictions)
+        history = load_lot_history(a.history)
+        return run(preds, history, a.pattern, a.output or HERE / "commonality_out", tuple(a.by),
+                   a.min_frac, a.min_n, a.min_lots, label=a.predictions.name, anonymize=a.anonymize)
+    except ValueError as e:                         # 스키마·로트 불일치는 traceback 대신 한 줄로
+        sys.exit(f"[오류] {e}")
 
 
 if __name__ == "__main__":

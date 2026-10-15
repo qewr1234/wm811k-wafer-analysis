@@ -12,10 +12,16 @@
 #   - prepare_wm811k.py --sample N 이 로트 단위로 N 로트만 남긴다.
 #   - calibrate.apply_rules(Thresholds()) 가 classify_wafer_pattern 판정(y_rule_default)과 동치.
 #   - calibrate.main / structural.main 이 tmp_path 에서 끝까지 돈다.
+#   - 합성 none 로트(make_lswmd n_none_lots) -> prepare -> evaluate --with-none -> wm811k_spc 가
+#     발생률(incidence) 관리도를 만드는 데까지 끝까지 돈다 (README ② 의 실측 경로 그대로).
+#   - 실측 스크립트 6개가 argparse 라 --help 로 종료 코드 0.
+#   - 루트 스크립트의 print / sys.exit 문자열 상수가 cp949 로 인코딩된다 (Windows 리다이렉트 회귀).
 # 캐시·결과 파일은 전부 tmp_path 에 쓴다 (HERE/CACHE monkeypatch).
 
 from __future__ import annotations
 
+import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,33 +37,26 @@ sys.path.insert(0, str(ROOT / "tests"))
 import prepare_wm811k as prep  # noqa: E402
 import wm811k_calibrate as cal  # noqa: E402
 import wm811k_evaluate as ev  # noqa: E402
+import wm811k_spc as spc  # noqa: E402
 import wm811k_structural as st  # noqa: E402
 import wm811k_validate as vd  # noqa: E402
-from synthetic_wm811k import df_to_wafermap, make_lswmd  # noqa: E402
-from wafer_map_visualizer import generate_sample_wafer_data  # noqa: E402
+from synthetic_wm811k import NONE_LABEL, make_lswmd  # noqa: E402
 
 N_LOTS = 30
+PIPELINE_SCRIPTS = ["prepare_wm811k.py", "wm811k_evaluate.py", "wm811k_calibrate.py",
+                    "wm811k_structural.py", "wm811k_validate.py", "wm811k_improve.py"]
 
 
-def _add_none_lots(df: pd.DataFrame, n_lots: int = 3, per_lot: int = 3) -> pd.DataFrame:
-    """'none' 라벨(정상) 로트를 붙인다. 합성 생성기에는 none 이 없어 --with-none 경로용으로 만든다."""
-    rows = []
-    for L in range(n_lots):
-        for w in range(per_lot):
-            d = generate_sample_wafer_data(defect_mode="clean", noise=0.0, seed=900 + 10 * L + w)
-            rows.append({"waferMap": df_to_wafermap(d, 10.0), "dieSize": 1.0,
-                         "lotName": f"lotNone{L}", "waferIndex": w,
-                         "trianTestLabel": np.array([["Training"]]),
-                         "failureType": np.array([["none"]])})
-    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+def _labels(df: pd.DataFrame) -> pd.Series:
+    return df["failureType"].apply(lambda a: a.reshape(-1)[0] if a.size else None)
 
 
 @pytest.fixture(scope="module")
 def data(tmp_path_factory):
-    """합성 LSWMD -> prepare -> labeled/defects pkl. 모듈 안에서 한 번만."""
+    """합성 LSWMD(결함 30로트 + none 3로트) -> prepare -> labeled/defects pkl. 모듈 안에서 한 번만."""
     d = tmp_path_factory.mktemp("c3data")
     src = d / "LSWMD.pkl"
-    _add_none_lots(make_lswmd(n_lots=N_LOTS, n_unlabeled=3, seed=2)).to_pickle(src)
+    make_lswmd(n_lots=N_LOTS, n_unlabeled=3, seed=2, n_none_lots=3).to_pickle(src)
     out = prep.prepare(src, d)
     assert out["n_defects"] > 0 and out["n_labeled"] > out["n_defects"]
     return {"src": src, "dir": d, "labeled": out["labeled"], "defects": out["defects"]}
@@ -155,6 +154,93 @@ def test_evaluate_tables(data):
     wt = ev.wafer_index_table(df, ev.CLASSES)
     assert wt is not None and int(wt["합계"].sum()) == len(df)
     assert ev.wafer_index_table(df.assign(wafer_index=np.nan)) is None
+
+
+def test_synthetic_none_lots_are_off_by_default():
+    """n_none_lots 기본 0: 기존 호출의 행 수·라벨·맵이 그대로다. 켜면 'none' 로트가 뒤에 붙는다."""
+    base = make_lswmd(n_lots=5, n_unlabeled=2, seed=7)
+    with_none = make_lswmd(n_lots=5, n_unlabeled=2, seed=7, n_none_lots=2)
+    assert NONE_LABEL not in set(_labels(base).dropna())
+    head = with_none.iloc[:len(base)]
+    assert _labels(head).equals(_labels(base))
+    assert all(np.array_equal(a, b) for a, b in zip(head["waferMap"], base["waferMap"]))
+    tail = with_none.iloc[len(base):]
+    assert (_labels(tail) == NONE_LABEL).all() and tail["lotName"].nunique() == 2
+    frac = tail["waferMap"].apply(lambda m: (m == 2).sum() / (m > 0).sum())
+    assert (frac <= 0.011).all()                                  # 산발 불량 0~1%: 규칙 분류기의 CLEAN 영역
+
+
+def test_with_none_feeds_spc_incidence_charts(tmp_path, monkeypatch):
+    """README ② 의 실측 경로를 합성으로 끝까지: none 로트 -> prepare -> evaluate --with-none ->
+    wm811k_spc 가 share 가 아니라 incidence(분모 = 전체 웨이퍼) 관리도를 만든다."""
+    src = tmp_path / "LSWMD.pkl"
+    raw = make_lswmd(n_lots=30, n_unlabeled=0, seed=5, n_none_lots=15)
+    n_none = int((_labels(raw) == NONE_LABEL).sum())
+    assert n_none > 0
+    raw.to_pickle(src)
+    out = prep.prepare(src, tmp_path)
+    assert out["n_labeled"] - out["n_defects"] == n_none        # none 은 labeled 에만 남는다
+
+    assert ev._cli(["--with-none"]).with_none and not ev._cli([]).with_none
+    monkeypatch.setattr(ev, "HERE", tmp_path)
+    ev.main(out["labeled"], include_none=True)                 # == python wm811k_evaluate.py <labeled> --with-none
+    pred_csv = tmp_path / "wm811k_predictions.csv"
+    res = pd.read_csv(pred_csv)
+    ok = res[~res["skipped"].astype(bool)]
+    assert "CLEAN" in set(ok["y_true"]) and "CLEAN" in set(ok["y_pred"])
+    # 불량 0~1% 의 none 웨이퍼는 미교정 규칙(clean_frac 0.02)으로도 CLEAN 이어야 분모가 '전체 웨이퍼'가 된다
+    assert (ok.loc[ok["y_true"] == "CLEAN", "y_pred"] == "CLEAN").mean() > 0.9
+
+    df = spc.load_predictions(pred_csv, verbose=False)
+    assert spc.chart_mode(df) == "incidence"
+    n_base = len(df) // 2
+    thr, _ = spc.resolve_conf_threshold(df, n_base, None, 0.10)
+    charts, sizes, dropped = spc.build_all(df, spc.CLASSES, 25, False, n_base, thr)
+    names = {ch.name for ch in charts}
+    assert names & set(spc.CLASSES), dropped                     # 패턴 발생률 관리도가 적어도 하나
+    assert "LOW_CONFIDENCE" in names                             # score -> confidence 별칭 경로
+    assert all(ch.n_base >= spc.MIN_BASE_GROUPS for ch in charts)
+    alarms = spc.alarm_table(charts, "incidence")
+    assert {"chart", "rule", "phase", "direction"} <= set(alarms.columns)
+
+
+@pytest.mark.parametrize("script", PIPELINE_SCRIPTS)
+def test_pipeline_scripts_answer_help(script):
+    """argparse: --help 가 pkl 을 열지 않고 종료 코드 0 으로 사용법을 낸다."""
+    r = subprocess.run([sys.executable, str(ROOT / script), "--help"], capture_output=True,
+                       text=True, encoding="utf-8", env={**os.environ, "MPLBACKEND": "Agg"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("usage:") and "pkl" in r.stdout
+
+
+def _console_literals(path: Path):
+    """print(...) / sys.exit(...) 호출 안의 문자열 상수 (f-string 조각 포함)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        is_print = isinstance(f, ast.Name) and f.id == "print"
+        is_exit = isinstance(f, ast.Attribute) and f.attr == "exit" and getattr(f.value, "id", "") == "sys"
+        if not (is_print or is_exit):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                yield sub.lineno, sub.value
+
+
+@pytest.mark.parametrize("script", sorted(p.name for p in ROOT.glob("*.py")) + ["tests/synthetic_wm811k.py"])
+def test_console_strings_are_cp949_safe(script):
+    """콘솔로 나가는 문자열에 cp949 밖 문자('—' U+2014, '−' U+2212 등)가 없어야 한다.
+    각 스크립트가 stdout 을 UTF-8 로 reconfigure 하지만, PYTHONIOENCODING=cp949 나 일부 IDE 출력창에서는
+    적용되지 않아 UnicodeEncodeError 로 죽는다. 그림·PDF·argparse help 문자열은 대상이 아니다."""
+    bad = []
+    for lineno, s in _console_literals(ROOT / script):
+        try:
+            s.encode("cp949")
+        except UnicodeEncodeError as e:
+            bad.append((lineno, f"U+{ord(s[e.start]):04X}", s[max(0, e.start - 10):e.end + 10]))
+    assert not bad, bad
 
 
 def test_evaluate_and_calibrate_split_agree(data, tmp_path, monkeypatch):

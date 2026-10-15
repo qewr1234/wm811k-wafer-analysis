@@ -4,12 +4,13 @@ on:
   push:
   pull_request:
 
-# 합성 데이터 자체 검증 + pytest + SPC 데모. 모두 코딩 오류 확인이지 성능이 아니다.
+# 린트 + 합성 데이터 자체 검증 + pytest + SPC 데모. 모두 코딩 오류 확인이지 성능이 아니다.
 # 실측 수치(README)는 LSWMD.pkl 이 필요해 CI 에서 재측정하지 않는다 (results/ 참고).
 # 한글 폰트는 docs/fonts/ 에 동봉되므로 apt 설치 단계가 없다.
 
 jobs:
   synthetic-checks:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -27,23 +28,38 @@ jobs:
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt
 
+      # 린트: 미사용 import·변수, 빈 f-string, 정의되지 않은 이름 (pyflakes 계열 F + E/W). 줄 길이는 보지 않는다.
+      - run: python -m ruff check --select E,F,W --ignore E501 .
+
       # 규칙 분류기 자체 검증 (7/7 이 아니면 종료 코드 1)
       - run: python wafer_pattern_classifier.py
 
-      # 특징 스냅샷·내보내기·SPC·파이프라인 테스트
+      # 특징 스냅샷·내보내기·SPC·파이프라인·현장 분석 테스트
       - run: python -m pytest -q
 
       # SPC 데모 (합성 시퀀스; 탐지 로직 확인용)
       - run: python wm811k_spc.py --demo --output spc_ci
 
-      # Windows: 파일 리다이렉트 시 stdout 이 cp949 가 되는 경로를 그대로 검증 (UnicodeEncodeError 회귀)
+      # Windows: 파일 리다이렉트 시 stdout 이 cp949 가 되는 경로를 그대로 검증 (UnicodeEncodeError 회귀).
+      # 데모가 있는 현장 스크립트 전부와, 합성 LSWMD 로 prepare -> evaluate(--with-none) -> SPC 실측 경로.
+      # cmd 배치는 앞 명령이 실패해도 멈추지 않으므로 줄마다 `|| exit /b 1` 로 종료 코드를 올린다.
       - if: runner.os == 'Windows'
         shell: cmd
-        run: python wm811k_spc.py --demo --output spc_ci > log.txt
+        run: |
+          python wm811k_spc.py --demo --output spc_ci > log_spc.txt || exit /b 1
+          python wm811k_lot_report.py --demo --output lot_report_ci > log_lot_report.txt || exit /b 1
+          python wm811k_commonality.py --demo --output commonality_ci > log_commonality.txt || exit /b 1
+          python wm811k_slot.py --demo --output slot_ci > log_slot.txt || exit /b 1
+          python wm811k_azimuth.py --demo --output azimuth_ci > log_azimuth.txt || exit /b 1
+          python wm811k_scratch_shape.py --demo --output scratch_ci > log_scratch.txt || exit /b 1
+          python tests\synthetic_wm811k.py data\LSWMD.pkl 20 5 > log_synthetic.txt || exit /b 1
+          python prepare_wm811k.py > log_prepare.txt || exit /b 1
+          python wm811k_evaluate.py > log_evaluate.txt || exit /b 1
+          python wm811k_evaluate.py data\wm811k_labeled.pkl --with-none > log_evaluate_none.txt || exit /b 1
+          python wm811k_spc.py wm811k_predictions.csv --output spc_synthetic_ci > log_spc_synthetic.txt || exit /b 1
 
-      - if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: spc_ci-py${{ matrix.python-version }}
+          name: spc_ci-${{ runner.os }}-py${{ matrix.python-version }}
           path: spc_ci/
           if-no-files-found: error

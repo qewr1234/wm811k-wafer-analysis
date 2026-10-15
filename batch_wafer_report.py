@@ -15,6 +15,8 @@
 #   2) --lang ko|en 으로 제목·표 머리·문구를 전환한다. 한글 폰트가 없으면 en 으로 자동 전환.
 #   3) --anonymize 로 로트 ID 를 짧은 키드 해시로 치환한다(매핑 표는 저장하지 않는다).
 #   4) 출력은 스크립트 옆(HERE)에 저장한다. PDF 메타데이터에 'synthetic data' 를 적는다.
+#   5) SOURCE_DATE_EPOCH 가 설정돼 있으면 생성일시·CreationDate 를 그 시각으로 고정한다(재현 가능한 산출물;
+#      make_figures.py 가 커밋용 샘플 PDF 를 만들 때 쓴다).
 #
 # 왜
 #   - 폰트: matplotlib 기본 폰트에 한글이 없어 환경에 따라 리포트가 깨졌다. _fonts.py 가
@@ -25,7 +27,8 @@
 # 한계
 #   합성 데이터다. 생성기와 분류기가 같은 규칙을 공유하므로 요약표의 '분류 일치율'은
 #   성능이 아니라 파이프라인 무결성 확인이다. 실측 성능은 README 의 WM-811K 결과를 쓸 것.
-#   서비스 리포트의 Tool/Chamber 필드는 비워 둔 양식이며 실제 장비 식별자를 넣지 않는다.
+#   서비스 리포트의 Tool/Chamber 필드는 비워 둔 양식이며 실제 장비 식별자를 넣지 않는다. '입력(기대)
+#   패턴·분류 불일치' 는 생성기 전용 정보라 로트 페이지·요약표에만 있고 서비스 리포트 양식에는 없다.
 #   ACTION_DETAIL 의 장비 서술은 공개 자료 기준이고 TEL 내부 구현·PM 주기는 모른다.
 #
 # 사용법
@@ -59,10 +62,9 @@ import random
 import sys
 import textwrap
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
@@ -89,9 +91,36 @@ A4_PORTRAIT = (8.27, 11.69)
 MAX_COLS = 3
 NOISE = 0.03
 YIELD_WARN = 90.0
-# SPC 알람 해제 조건(이 저장소의 운용 규칙): 조치 후 부분군 N 개 연속 p 가 중심선 +-1 sigma 안,
-# 상승 규칙(R1~R4, EWMA) 알람 0 건. Western Electric R4 가 '8점 연속 한쪽' 이므로 같은 길이로 둔다.
-SPC_CLEAR_SUBGROUPS = 8
+# SPC 알람 해제(조치 효과 확인) 기준 - 이 저장소의 운용 규칙 한 벌. docs/spc.md '알람 해제 기준',
+# docs/handoff.md 종결 보고, docs/case_study_8d.md D6 가 같은 기준을 쓴다.
+#   (1) 조치 이벤트 이후 완성된 부분군 SPC_CLEAR_SUBGROUPS 개에서 상승 규칙(R1~R4)·EWMA 알람 0 건
+#   (2) 조치 전후 원시 비율의 이항 검정 p >= 0.05 (조치 후 비율이 baseline 과 다르지 않음; roadmap 10-d)
+#   (3) 드문 패턴(부분군이 커서 조치 후 부분군이 아직 안 찬 것)은 (2) 로 먼저 판정하고 다음 부분군 완성 때 (1) 재확인
+# '중심선 +-1 sigma 안' 은 쓰지 않는다 - WE 의 '15점 연속 1 sigma 안(층화 경고)' 과 방향이 겹친다.
+# 5 는 케이스 스터디 A(D6: 부분군 5개 5174~5974) 와 같은 값. EWMA 는 lambda 0.2 의 기억 때문에
+# 복귀가 몇 부분군 늦으므로 (1) 은 '새 상승 알람 없음' 으로 본다.
+SPC_CLEAR_SUBGROUPS = 5
+SPC_CLEAR_P = 0.05
+
+
+def _now() -> datetime:
+    """현재 시각. SOURCE_DATE_EPOCH 가 있으면 그 시각(UTC) - make_figures.py 가 커밋용 그림·PDF 를
+    재현 가능하게 만들 때 쓴다(matplotlib 도 같은 변수로 PDF/SVG 날짜 메타데이터를 고정한다)."""
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+    return datetime.now()
+
+
+def positive_int(text: str) -> int:
+    """argparse type: 1 이상의 정수. --wafers-per-lot 0 은 ZeroDivisionError 대신 사용법 오류로."""
+    try:
+        v = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"integer expected: {text!r}") from None
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1: {text!r}")
+    return v
 
 ALL_MODES = ["ring", "center", "donut", "edge_loc", "scratch", "random", "clean"]
 # 일치 판정은 wafer_pattern_classifier.expected_patterns(mode, NOISE) 로 한다.
@@ -131,13 +160,21 @@ LABELS: dict[str, dict[str, str]] = {
         # 서비스 리포트
         "sr_title": "서비스 리포트 / Service Report",
         "sr_banner": "합성 데이터 - 양식 예시 / SYNTHETIC DATA - form sample. 실제 장비·고객 데이터가 아니다.",
+        # 머리 표 12칸(2열 x 6행). docs/handoff.md 2절 '초동 보고' 항목(현상·심각도·봉쇄 조치 제안·
+        # 요청 데이터·다음 보고 시각)과 1:1 - 요청 데이터는 5절 '수집 데이터' 에 있다.
         "sr_meta": [("장비 ID / Tool ID", ""), ("챔버 / Chamber", ""), ("로트 / Lot", "{lot}"),
                     ("일자 / Date", "{date}"), ("작성자 / Engineer", ""), ("고객 담당 / Customer contact", ""),
-                    ("보고서 번호 / Report No.", ""), ("심각도 / Severity", "{sev}")],
+                    ("보고서 번호 / Report No.", ""), ("심각도 / Severity", "{sev}"),
+                    ("영향 범위 / Affected scope", "{scope}"), ("봉쇄 조치 제안 / Containment", "{contain}"),
+                    ("보고 단계 / Report stage", "{stage}"), ("다음 보고 예정 / Next report", "")],
+        "sr_stage": "초동 보고 / initial",
+        "sr_scope": "로트 1 / {n}장 (수율 {warn:.0f}% 미만 {low}장)",
+        "sr_contain": {"monitor": "홀드 없음 - 관리도 모니터링", "lot_hold": "로트 홀드 검토, 챔버 격리 여부 판단",
+                       "line_stop_review": "로트 홀드 + 라인 정지 판단 요청", "": "-"},
         "sr_sev_escalated": " (+1: 로트 내 반복)",
         "sr_h_obs": "1. 현상 / Observation",
         "sr_obs": ("웨이퍼 {n}장 중 패턴 분포 {mix}. 평균 수율 {avg:.1f}% (최저 {mn:.1f}%), "
-                   "수율 {warn:.0f}% 미만 {low}장. 입력(기대) 패턴 {mode}, 분류 불일치 {mis}장."),
+                   "수율 {warn:.0f}% 미만 {low}장."),
         "sr_h_cls": "2. 분류 결과와 점수 / Classification and score",
         "sr_cls_row": "{w}: {p} (score {s:.2f}), 수율 {y:.1f}%, FAIL {f}{flag}",
         "sr_cls_more": "... 외 {n}장 (로트 페이지 참조)",
@@ -149,12 +186,14 @@ LABELS: dict[str, dict[str, str]] = {
         "sr_action": "[{sev}] {s}",
         "sr_handoff": "판정 기준: {s}",
         "sr_h_follow": "5. 후속 확인 / Follow-up",
-        "sr_follow": ("SPC 알람 해제 조건: 조치 후 부분군 {n}개 연속 패턴 비율 p 가 중심선 +-1 sigma 안으로 복귀하고 "
-                      "상승 규칙(R1~R4, EWMA) 알람 0건. 복귀 확인 시각을 alarms.csv 의 verified_at 에 적는다."),
+        "sr_follow": ("SPC 알람 해제 기준(docs/spc.md): (1) 조치 이벤트 이후 부분군 {n}개에서 상승 규칙(R1~R4)·EWMA 알람 0건, "
+                      "(2) 조치 전후 원시 비율의 이항 검정 p >= {p:.2f}, (3) 드문 패턴은 (2)로 먼저 판정하고 다음 부분군 완성 때 (1) 재확인. "
+                      "확인 시각을 alarms.csv 의 verified_at 에 적는다."),
         "sr_follow2": "수집 데이터 / Data to collect: {s}",
         "sr_h_evid": "6. 증거 체크 / Evidence checklist",
         "sr_evid_cust": "고객 측 / Customer-side",
         "sr_evid_tool": "장비 측 / Tool-side",
+        "sr_h_notes": "7. 비고 / Notes (현장 기록: 확인한 것 / 배제한 것 / 다음 행동)",
         "sr_sign": "작성 / Prepared: ____________    검토 / Reviewed: ____________    고객 확인 / Customer ack: ____________",
         "sr_foot": ("조치 문구는 wafer_pattern_classifier.ACTION_DETAIL (docs/defect_signatures.md 와 동일 소스) 기준. "
                     "공개 자료 수준의 서술이며 TEL 내부 구현·매뉴얼 PM 주기는 모른다. '(추정)' 표시는 확인되지 않은 것."),
@@ -193,11 +232,17 @@ LABELS: dict[str, dict[str, str]] = {
         "sr_title": "Service Report",
         "sr_banner": "SYNTHETIC DATA - form sample. Not real tool or customer data.",
         "sr_meta": [("Tool ID", ""), ("Chamber", ""), ("Lot", "{lot}"), ("Date", "{date}"),
-                    ("Engineer", ""), ("Customer contact", ""), ("Report No.", ""), ("Severity", "{sev}")],
+                    ("Engineer", ""), ("Customer contact", ""), ("Report No.", ""), ("Severity", "{sev}"),
+                    ("Affected scope", "{scope}"), ("Containment proposal", "{contain}"),
+                    ("Report stage", "{stage}"), ("Next report due", "")],
+        "sr_stage": "initial",
+        "sr_scope": "1 lot / {n} wafers ({low} below {warn:.0f}%)",
+        "sr_contain": {"monitor": "no hold - monitor the chart", "lot_hold": "lot hold review; decide chamber isolation",
+                       "line_stop_review": "lot hold + request line-stop decision", "": "-"},
         "sr_sev_escalated": " (+1: repeats in lot)",
         "sr_h_obs": "1. Observation",
         "sr_obs": ("{n} wafers; pattern mix {mix}. Mean yield {avg:.1f}% (min {mn:.1f}%), "
-                   "{low} wafers below {warn:.0f}%. Input (expected) pattern {mode}, {mis} mismatched."),
+                   "{low} wafers below {warn:.0f}%."),
         "sr_h_cls": "2. Classification and score",
         "sr_cls_row": "{w}: {p} (score {s:.2f}), yield {y:.1f}%, FAIL {f}{flag}",
         "sr_cls_more": "... and {n} more (see lot page)",
@@ -209,13 +254,15 @@ LABELS: dict[str, dict[str, str]] = {
         "sr_action": "[{sev}] {s}",
         "sr_handoff": "Decision rule: {s}",
         "sr_h_follow": "5. Follow-up",
-        "sr_follow": ("SPC alarm clearance: after the action, {n} consecutive subgroups with the pattern rate p "
-                      "back within +-1 sigma of the center line and zero upward-rule alarms (R1-R4, EWMA). "
+        "sr_follow": ("SPC alarm clearance (docs/spc.md): (1) zero upward-rule (R1-R4) and EWMA alarms in the {n} subgroups "
+                      "completed after the action event, (2) binomial test of the raw rate before vs after the action p >= {p:.2f}, "
+                      "(3) for rare patterns decide on (2) first and re-check (1) when the next subgroup completes. "
                       "Record the time in alarms.csv verified_at."),
         "sr_follow2": "Data to collect: {s}",
         "sr_h_evid": "6. Evidence checklist",
         "sr_evid_cust": "Customer-side",
         "sr_evid_tool": "Tool-side",
+        "sr_h_notes": "7. Notes (field record: confirmed / ruled out / next action)",
         "sr_sign": "Prepared: ____________    Reviewed: ____________    Customer ack: ____________",
         "sr_foot": ("Action text comes from wafer_pattern_classifier.ACTION_DETAIL (same source as docs/defect_signatures.md). "
                     "Public-source level only; TEL internal implementation and manual PM intervals are unknown. "
@@ -553,9 +600,21 @@ class _Page:
             written += 1
         return written
 
+    def ruled_lines(self, size: int = 9, min_lines: int = 2) -> int:
+        """남은 지면을 손으로 적는 빈 줄(가로선)로 채운다. 그은 줄 수를 돌려준다(공간이 min_lines 미만이면 0)."""
+        step = self._step(size)
+        n = int((self.y - self.bottom) / step)
+        if n < min_lines:
+            return 0
+        for _ in range(n):
+            self.y -= step
+            self.ax.plot([self.left, self.right], [self.y, self.y], color="#CFD8DC", linewidth=0.5,
+                         transform=self.ax.transAxes)
+        return n
+
     def checklist(self, left_title: str, left_items: list[str], right_title: str,
-                  right_items: list[str], size: int = 7, max_rows: int = 5) -> None:
-        """두 열 체크박스. 각 열은 반 폭을 쓴다."""
+                  right_items: list[str], size: int = 7, max_rows: int | None = None) -> None:
+        """두 열 체크박스. 각 열은 반 폭을 쓴다. max_rows 가 None 이면 지면이 허용하는 만큼 전부."""
         if not self.fits(2, 9):
             self.truncated = True
             return
@@ -567,7 +626,8 @@ class _Page:
             self.ax.text(x, y, title, fontsize=9, fontweight="bold", va="top", ha="left",
                          color=self.HEAD, transform=self.ax.transAxes)
             y -= self._step(9)
-            for s in items[:max_rows]:
+            shown = items if max_rows is None else items[:max_rows]
+            for s in shown:
                 lines = textwrap.wrap("[ ] " + s, width=self.wrap_width(s, size, frac=0.47)) or [""]
                 if y - len(lines) * self._step(size) < self.bottom:
                     self.truncated = True
@@ -576,8 +636,8 @@ class _Page:
                     self.ax.text(x + (0.014 if j else 0.0), y, ln, fontsize=size, va="top", ha="left",
                                  color=self.INK, transform=self.ax.transAxes)
                     y -= self._step(size)
-            if len(items) > max_rows:
-                self.ax.text(x, y, f"    (+{len(items) - max_rows})", fontsize=size, va="top",
+            if len(items) > len(shown):
+                self.ax.text(x, y, f"    (+{len(items) - len(shown)})", fontsize=size, va="top",
                              ha="left", color=self.MUTED, transform=self.ax.transAxes)
                 y -= self._step(size)
             self.y = min(self.y, y)
@@ -593,14 +653,16 @@ def build_service_report_page(lot_summary: LotSummary, lang: str = "ko",
                               report_time: str | None = None) -> plt.Figure:
     """로트 하나의 A4 세로 1페이지 서비스 리포트 Figure 를 만든다. 저장은 호출 측이 한다.
 
-    상단 메타(Tool/Chamber 는 빈 양식) -> 현상 -> 분류 결과 -> 의심 원인 순위 -> 권고 조치
-    -> 후속 확인(SPC 알람 해제 조건) -> 고객 측/장비 측 증거 체크박스. 조치 문구는
-    ACTION_DETAIL 이 있으면 그것을, 없으면 ACTIONS 한 줄을 쓴다.
+    상단 메타(Tool/Chamber 는 빈 양식; 영향 범위·봉쇄 조치 제안·보고 단계·다음 보고 예정은 docs/handoff.md
+    초동 보고 항목) -> 현상 -> 분류 결과 -> 의심 원인 순위 -> 권고 조치 -> 후속 확인(SPC 알람 해제 기준)
+    -> 고객 측/장비 측 증거 체크박스 -> 남는 지면은 비고 빈 줄. 조치 문구는 ACTION_DETAIL 이 있으면
+    그것을, 없으면 ACTIONS 한 줄을 쓴다. 목록은 자르지 않고 지면이 끝나면 '생략' 표시를 남긴다.
+    '입력(기대) 패턴·분류 불일치' 는 합성 생성기 전용 정보라 로트 페이지에만 있고 이 양식에는 없다.
     """
     setup_korean_font()
     L = LABELS[lang]
     lot = lot_summary
-    report_time = report_time or datetime.now().strftime("%Y-%m-%d %H:%M")
+    report_time = report_time or _now().strftime("%Y-%m-%d %H:%M")
     top = lot.top_pattern
     detail = ACTION_DETAIL.get(top)
     sev_key = detail["severity"] if detail else ""
@@ -609,6 +671,8 @@ def build_service_report_page(lot_summary: LotSummary, lang: str = "ko",
     if detail and lot.pattern_counts[top] >= 2 and sev_key == "monitor" and top != "CLEAN":
         sev_key = "lot_hold"
         sev_text = _severity_text(sev_key, lang) + L["sr_sev_escalated"]
+    scope = L["sr_scope"].format(n=lot.n, warn=YIELD_WARN, low=lot.n_low_yield)
+    contain = L["sr_contain"].get(sev_key, L["sr_contain"][""])
 
     fig = plt.figure(figsize=A4_PORTRAIT)
     ax = fig.add_axes((0, 0, 1, 1))
@@ -630,8 +694,9 @@ def build_service_report_page(lot_summary: LotSummary, lang: str = "ko",
             color="#E65100", transform=ax.transAxes)
     page.gap(0.030)
 
-    # 메타 표 (2열 x 4행)
-    meta = [(k, v.format(lot=lot.lot_id, date=report_time, sev=sev_text)) for k, v in L["sr_meta"]]
+    # 메타 표 (2열 x 6행)
+    meta = [(k, v.format(lot=lot.lot_id, date=report_time, sev=sev_text, scope=scope, contain=contain,
+                         stage=L["sr_stage"])) for k, v in L["sr_meta"]]
     col_w = (page.right - page.left) / 2
     row_h = 0.021
     for i, (k, v) in enumerate(meta):
@@ -645,13 +710,13 @@ def build_service_report_page(lot_summary: LotSummary, lang: str = "ko",
         ax.text(x + col_w * 0.46, y - row_h / 2, v if v else "________________",
                 fontsize=8 if len(v) <= 28 else 6.5,
                 va="center", ha="left", color=page.INK if v else "#B0BEC5", transform=ax.transAxes)
-    page.gap(row_h * (len(meta) // 2) + 0.006)
+    page.gap(row_h * math.ceil(len(meta) / 2) + 0.006)
 
     # 1. 현상
     page.heading(L["sr_h_obs"])
     mix = ", ".join(f"{p} {n}" for p, n in lot.pattern_counts.items())
     page.line(L["sr_obs"].format(n=lot.n, mix=mix, avg=lot.avg_yield, mn=lot.min_yield, warn=YIELD_WARN,
-                                 low=lot.n_low_yield, mode=lot.mode.upper(), mis=lot.n_mismatch))
+                                 low=lot.n_low_yield))
 
     # 2. 분류 결과
     page.heading(L["sr_h_cls"])
@@ -668,11 +733,11 @@ def build_service_report_page(lot_summary: LotSummary, lang: str = "ko",
     if detail:
         if detail.get("rule_out_first"):
             page.line(L["sr_rule_out"].format(s=detail["rule_out_first"]), bold=True, color="#C62828")
-        page.items(detail["first_checks"], numbered=True, max_items=6)
+        page.items(detail["first_checks"], numbered=True)
         page.line(L["sr_tel"], bold=True, color=page.MUTED)
-        page.items(detail["tel_modules"], size=7, max_items=5)
+        page.items(detail["tel_modules"], size=7)
         page.line(L["sr_non_tel"], bold=True, color=page.MUTED)
-        page.items(detail["non_tel"], size=7, max_items=3)
+        page.items(detail["non_tel"], size=7)
     else:
         page.line(L["sr_no_detail"], color=page.MUTED)
         page.line(ACTIONS.get(top, "-"), indent=0.012)
@@ -685,17 +750,21 @@ def build_service_report_page(lot_summary: LotSummary, lang: str = "ko",
 
     # 5. 후속 확인
     page.heading(L["sr_h_follow"])
-    page.line(L["sr_follow"].format(n=SPC_CLEAR_SUBGROUPS))
+    page.line(L["sr_follow"].format(n=SPC_CLEAR_SUBGROUPS, p=SPC_CLEAR_P))
     if detail:
-        page.line(L["sr_follow2"].format(s="; ".join(detail["data_to_collect"][:4])), size=7, indent=0.012)
+        page.line(L["sr_follow2"].format(s="; ".join(detail["data_to_collect"])), size=7, indent=0.012)
 
     # 6. 증거 체크
     page.heading(L["sr_h_evid"])
     if detail:
-        page.checklist(L["sr_evid_cust"], detail["customer_evidence"], L["sr_evid_tool"],
-                       detail["tool_evidence"], max_rows=6)
+        page.checklist(L["sr_evid_cust"], detail["customer_evidence"], L["sr_evid_tool"], detail["tool_evidence"])
     else:
         page.checklist(L["sr_evid_cust"], ["-"], L["sr_evid_tool"], ["-"])
+
+    # 7. 비고 - 남는 지면을 손으로 적는 빈 줄로 채운다(현장 기록란). 자리가 없으면 생략.
+    if not page.truncated and page.fits(4, 10):
+        page.heading(L["sr_h_notes"])
+        page.ruled_lines()
 
     if page.truncated:
         ax.text(page.left, page.bottom + 0.004, L["sr_truncated"].format(p=top), fontsize=6.5, va="bottom",
@@ -733,8 +802,11 @@ def generate_batch_pdf_report(
     seed           : 재현성 시드
     lang           : 'ko' | 'en'. 한글 폰트가 없으면 ko 는 en 으로 자동 전환
     service_report : 'all' | 'flagged'(불일치 또는 수율 경고 로트만) | 'none'
-    anonymize      : 로트 ID 를 키드 해시로 치환. salt 가 None 이면 실행마다 새로 뽑는다
+    anonymize      : 로트 ID 를 키드 해시로 치환
+    salt           : --anonymize 해시 키(bytes). None 이면 실행마다 새로 뽑는다(os.urandom). 같은 salt 면 같은 해시
     quiet          : 콘솔 출력 생략
+
+    생성일시·PDF CreationDate 는 SOURCE_DATE_EPOCH 가 있으면 그 시각(UTC)으로 고정된다(_now 참고).
 
     Returns
     -------
@@ -756,7 +828,8 @@ def generate_batch_pdf_report(
 
     rng = random.Random(seed)          # 전역 random 오염 방지 + 재현성
     salt = os.urandom(8) if salt is None else salt
-    report_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = _now()
+    report_time = now.strftime("%Y-%m-%d %H:%M")
 
     all_results: list[WaferResult] = []
     service_lots: set[str] = set()
@@ -790,7 +863,7 @@ def generate_batch_pdf_report(
                         f"(generator and classifier share rules) - not customer or tool data")
         d["Keywords"] = "synthetic data, wafer map, defect pattern, service report, WM-811K-style demo"
         d["Creator"] = "batch_wafer_report.py (wm811k-wafer-analysis)"
-        d["CreationDate"] = datetime.now()
+        d["CreationDate"] = now
 
     n_pages = 1 + len(lot_configs) + len(service_lots) + 1
     summary.attrs.update({"n_pages": n_pages, "service_report_lots": sorted(service_lots),
@@ -817,10 +890,10 @@ def main(argv: list[str] | None = None) -> pd.DataFrame:
     ap.add_argument("--service-report", choices=SERVICE_REPORT_MODES, default="flagged",
                     help="서비스 리포트 페이지를 붙일 로트: all / flagged(불일치 또는 수율 경고) / none")
     ap.add_argument("--anonymize", action="store_true", help="로트 ID 를 키드 해시로 치환 (매핑 표 미저장)")
-    ap.add_argument("--wafers-per-lot", type=int, default=3)
+    ap.add_argument("--wafers-per-lot", type=positive_int, default=3, help="Lot 당 웨이퍼 수 (1 이상)")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--demo", action="store_true", help="합성 데모 로트 6개 (기본값이며 명시용)")
     args = ap.parse_args(argv)
+    # 입력은 항상 합성 데모 로트 6개(DEMO_LOTS)다. 실측 입력 경로는 없으므로 --demo 같은 선택 플래그를 두지 않는다.
 
     summary = generate_batch_pdf_report(DEMO_LOTS, args.out, wafers_per_lot=args.wafers_per_lot,
                                         seed=args.seed, lang=args.lang, service_report=args.service_report,

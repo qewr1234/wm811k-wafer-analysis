@@ -19,6 +19,8 @@
 | 라이선스 | **소유자가 Kaggle 페이지의 License 필드를 직접 확인한 뒤 기입**: ______ (확인일: ______). 확인 전까지 실측 맵 썸네일은 저장소에 커밋하지 않는다 |
 | SHA256 | 소유자가 내려받은 파일로 기입: ______ |
 
+**pickle 주의.** `*.pkl`은 Python pickle 형식이라 신뢰할 수 없는 파일을 열면 역직렬화 과정에서 임의 코드가 실행될 수 있다(`pd.read_pickle`을 쓰는 `prepare_wm811k.py`, `wm811k_evaluate.py`, `wm811k_azimuth.py` 등 모두 해당). 내려받은 `LSWMD.pkl`은 **위 SHA256과 대조한 뒤에만** 열고, 출처가 불분명한 pkl은 열지 않는다. 추출본(`wm811k_labeled.pkl`, `wm811k_defects.pkl`)은 이 저장소 스크립트가 만든 것만 쓴다. 팹 데이터를 넣을 때는 pkl이 아니라 **CSV 경로**를 쓴다 — 예측 CSV(`lot`, `y_pred`, `confidence` 등)는 `wm811k_spc.py`·`wm811k_slot.py`·`wm811k_commonality.py`의 입력, 로트 이력 CSV는 [`../docs/lot_history_schema.md`](../docs/lot_history_schema.md), 파라메트릭 맵 CSV(`die_x`, `die_y`, `value`)는 `plotly_wafer_heatmap.py --csv`. 다이 격자 pass/fail CSV를 분류기에 직접 넣는 경로는 [`../docs/roadmap.md`](../docs/roadmap.md) 7의 남은 항목이다.
+
 인용 조건: 이 데이터를 쓴 산출물은 원 논문을 인용한다.
 
 > Wu, M.-J., Jang, J.-S. R., & Chen, J.-L. (2015). Wafer map failure pattern recognition and similarity ranking for large-scale data sets. *IEEE Transactions on Semiconductor Manufacturing*, 28(1), 1-12.

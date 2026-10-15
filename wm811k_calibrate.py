@@ -49,6 +49,7 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 
 from wafer_map_visualizer import wafermap_to_df
 from wafer_pattern_classifier import classify_wafer_pattern
+from wm811k_evaluate import CLASSES, MIN_DIE, load_defect_frame, skipped_note
 
 if sys.platform == "win32":                      # Windows 파일/파이프 리다이렉트의 cp949 오류 방지
     sys.stdout.reconfigure(encoding="utf-8")
@@ -59,16 +60,8 @@ DATA_DIR = Path(os.getenv("WM811K_DIR", HERE / "data"))   # 환경변수 또는 
 FEATURE_CACHE = HERE / "wm811k_features.csv"               # 실행 폴더와 무관하게 스크립트 옆에
 SPLIT_SEED, TEST_FRAC = 42, 0.3                            # wm811k_evaluate.lot_group_split 과 동일
 
-CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
-           "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
+# CLASSES / LABEL_MAP(결함 8종) / MIN_DIE 는 wm811k_evaluate 와 한 소스다.
 FEATURES = ["fail_frac", "r_mean", "r_med", "r_std", "dir_c", "axial_c"]
-
-LABEL_MAP = {
-    "Edge-Ring": "EDGE_RING", "Edge-Loc": "EDGE_LOC", "Center": "CENTER",
-    "Loc": "LOC", "Scratch": "SCRATCH", "Random": "RANDOM",
-    "Donut": "DONUT", "Near-full": "NEAR_FULL",
-}
-MIN_DIE = 100
 
 
 # ──────────────────────────────────────────
@@ -79,32 +72,20 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
         print(f"특징 캐시 사용: {FEATURE_CACHE}")
         return pd.read_csv(FEATURE_CACHE)
 
-    if path is None:
-        for name in ["wm811k_defects.pkl", "LSWMD.pkl"]:
-            if (DATA_DIR / name).exists():
-                path = DATA_DIR / name
-                break
-        else:
-            sys.exit("데이터 파일을 찾을 수 없다.")
-
-    print(f"로드: {path.name}")
-    df = pd.read_pickle(path)
-    if "ftype" not in df.columns:
-        df["ftype"] = df["failureType"].apply(
-            lambda v: str(np.asarray(v).reshape(-1)[0]) if np.asarray(v).size else None
-        )
-    df["lot"] = (df["lotName"] if "lotName" in df.columns else "unknown").astype(str)
-    df = df[df["ftype"].isin(LABEL_MAP)].copy()
-    df["y_true"] = df["ftype"].map(LABEL_MAP)
+    df = load_defect_frame(path, DATA_DIR)
 
     recs, t0 = [], time.time()
+    n_skip, first_err = 0, None
     for i, (wmap, y, lot) in enumerate(zip(df["waferMap"], df["y_true"], df["lot"])):
         arr = np.asarray(wmap)
         if arr.ndim != 2 or (arr > 0).sum() < MIN_DIE:
+            n_skip += 1
             continue
         try:
             r = classify_wafer_pattern(wafermap_to_df(arr))
-        except Exception:
+        except Exception as e:                   # 퇴화된 맵 방어. 건수는 끝에 보고한다
+            n_skip += 1
+            first_err = first_err or f"{type(e).__name__}: {e}"
             continue
         recs.append({
             "y_true": y, "lot": lot, "n_die": int((arr > 0).sum()),
@@ -118,7 +99,7 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
 
     out = pd.DataFrame(recs)
     out.to_csv(FEATURE_CACHE, index=False, encoding="utf-8-sig")
-    print(f"특징 저장: {FEATURE_CACHE} ({len(out)}행)")
+    print(f"특징 저장: {FEATURE_CACHE} ({len(out)}행; {skipped_note(len(df), n_skip, first_err)})")
     return out
 
 
@@ -295,7 +276,7 @@ def main(path: Path | None = None):
         macro_f1(tr["y_true"], apply_rules(tr, tuned)),
         macro_f1(te["y_true"], apply_rules(te, tuned)),
     )
-    print(f"\n  교정된 임계값:")
+    print("\n  교정된 임계값:")
     for k, v in asdict(tuned).items():
         mark = "  <- 변경" if v != getattr(base, k) else ""
         print(f"    {k:16s} {getattr(base, k):>6.3f} → {v:>6.3f}{mark}")
@@ -319,7 +300,7 @@ def main(path: Path | None = None):
             macro_f1(tr["y_true"], model.predict(tr[FEATURES].to_numpy())),
             macro_f1(te["y_true"], model.predict(te[FEATURES].to_numpy())),
         )
-    print(f"\n  결정트리 test 클래스별:")
+    print("\n  결정트리 test 클래스별:")
     print(classification_report(te["y_true"], tree.predict(te[FEATURES].to_numpy()),
                                 labels=CLASSES, digits=3, zero_division=0))
 

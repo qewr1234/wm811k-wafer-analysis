@@ -1,6 +1,7 @@
 # tests/test_spc.py
-# SPC 규칙·관리도 계산·데모 시나리오·현장 옵션(--group-col, --event-col, --anonymize)의 코딩 오류를 잡는다.
-# 전부 합성 데이터다. 탐지 성능 주장이 아니라 로직 확인이다.
+# SPC 규칙·관리도 계산·데모 시나리오·현장 옵션(--group-col, --event-col, --anonymize, --anon-key-env)·
+# 알람 요약 보고서(단발 알람 구분)·main 의 두 경로(--demo, 예측 CSV + --time-col/--subgroup lot/--no-laney/--classes)의
+# 코딩 오류를 잡는다. 전부 합성 데이터다. 탐지 성능 주장이 아니라 로직 확인이다.
 
 from __future__ import annotations
 
@@ -61,7 +62,7 @@ def test_western_electric_sides_do_not_mix():
 
 
 def test_ewma_limits_grow_to_asymptote():
-    assert spc.EWMA_LAMBDA == 0.2 and spc.EWMA_L == 2.86      # λ=0.2, ARL0≈500 (Lucas & Saccucci 1990 표)
+    assert spc.EWMA_LAMBDA == 0.2 and spc.EWMA_L == 2.86      # λ=0.2, ARL0≈370 (마르코프 체인 자체 계산 371; R1 3σ 와 같은 수준, docs/spc.md 5절)
     e, lim = spc.ewma_chart(np.zeros(200))
     assert np.all(np.diff(lim) >= 0)
     assert lim[-1] == pytest.approx(spc.EWMA_L * np.sqrt(spc.EWMA_LAMBDA / (2 - spc.EWMA_LAMBDA)), rel=1e-3)
@@ -241,12 +242,35 @@ def test_demo_plot_and_report(demo, tmp_path):
     spc.plot_charts(demo["charts"], demo["n_base_rows"], tmp_path / "demo.png", "t", lang="en", events=events)
     assert (tmp_path / "demo.png").stat().st_size > 10_000
     ev = spc.event_distance(demo["charts"], demo["alarms"], events)
-    spc.write_report(tmp_path / "r.md", dict(
+    ctx = spc.RunContext(
         lang="ko", stem="t", source="demo", synthetic=True, mode="incidence", range_text="r",
         settings_text="s", base_rate_text="b", charts=demo["charts"], alarms=demo["alarms"],
-        n_down=0, event_dist=ev, group_table=None, dropped=demo["dropped"], png_name="demo.png"))
+        n_down=0, event_dist=ev, n_events=len(events), dropped=demo["dropped"], png_name="demo.png")
+    spc.write_report(tmp_path / "r.md", ctx)
     text = (tmp_path / "r.md").read_text(encoding="utf-8")
     assert "EDGE_RING" in text and "합성" in text and "demo.png" in text
+    assert spc.LABELS["ko"]["r_points"] in text and spc.LABELS["ko"]["r_no_events"] not in text
+    # --event-col 열이 전부 비어 있으면 보고서에 그 사실을 적는다
+    ctx.n_events = 0
+    spc.write_report(tmp_path / "r0.md", ctx)
+    assert spc.LABELS["ko"]["r_no_events"] in (tmp_path / "r0.md").read_text(encoding="utf-8")
+
+
+def test_alarm_profile_single_r1_vs_run():
+    """R1 1점뿐이면 단발(점검 목록 대신 한 줄), 여러 부분군이 이어지면 연속 길이를 센다."""
+    # 1점 z≈3.3: R1 만 울린다 (z 가 아주 크면 EWMA 도 한 점으로 넘는데, 그건 정의상 단발이 아니다)
+    S = pd.DataFrame({"n": [100] * 12, "count": [30] * 6 + [30, 45, 30, 30, 30, 30], "end_idx": np.arange(100, 1300, 100)})
+    one = spc.alarm_table([spc.p_chart("CENTER", S, n_base=6, laney=False)], "incidence")
+    p = spc.alarm_profile("CENTER", one)
+    assert p == {"points": 1, "rules": ["R1"], "run": 1, "single": True}
+    assert spc.profile_text(p, "ko") == "1 (R1); 단발" and spc.profile_text(p, "en") == "1 (R1); single"
+    S = pd.DataFrame({"n": [100] * 12, "count": [30] * 6 + [30, 60, 60, 60, 60, 60], "end_idx": np.arange(100, 1300, 100)})
+    run = spc.alarm_table([spc.p_chart("CENTER", S, n_base=6, laney=False)], "incidence")
+    p = spc.alarm_profile("CENTER", run)
+    assert p["points"] == 5 and p["run"] == 5 and not p["single"] and "R2" in p["rules"]
+    assert spc.profile_text(p, "ko").endswith("; 연속 5점")
+    # 알람이 없는 관리도
+    assert spc.alarm_profile("NOPE", run) == {"points": 0, "rules": [], "run": 0, "single": False}
 
 
 def test_alarm_table_marks_down_alarms_and_has_field_columns():
@@ -299,11 +323,27 @@ def test_event_col_distance_to_nearest_previous_event(demo):
     assert (ev2["event_idx"] == -1).all()
 
 
+def test_event_col_entirely_empty(demo, tmp_path, capsys, monkeypatch):
+    """열은 있는데 값이 전부 비어 있으면 이벤트 0개. main 은 빈 목록 대신 '이벤트 없음' 을 찍고 보고서에도 적는다."""
+    df = demo["df"].assign(event="")
+    assert len(spc.event_marks(df, "event")) == 0
+    assert len(spc.event_marks(df.assign(event=np.nan), "event", group_col="chamber")) == 0
+    p = tmp_path / "noevent.csv"
+    df.to_csv(p, index=False)
+    monkeypatch.setattr(spc, "setup_korean_font", lambda: None)
+    spc.main([str(p), "--event-col", "event", "--classes", "EDGE_RING", "--output", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert spc.LABELS["ko"]["r_no_events"] in out and "  이벤트 \n" not in out
+    assert spc.LABELS["ko"]["r_no_events"] in (tmp_path / "spc_noevent_report.md").read_text(encoding="utf-8")
+
+
 def test_anonymize_removes_original_ids_from_outputs(demo, tmp_path):
     df = demo["df"]
     anon = spc.anonymize_ids(df, ["lot", "chamber"], salt=b"test")
     assert not set(anon["lot"]) & set(df["lot"]) and anon["lot"].nunique() == df["lot"].nunique()
     assert set(anon["chamber"]) & {"A", "B"} == set() and anon["chamber"].nunique() == 2
+    # 8바이트 = 16 hex. 4바이트면 WM-811K 전체 로트 수(46,293)에서 충돌 확률이 22% 다
+    assert spc.ANON_DIGEST_SIZE == 8 and anon["lot"].str.fullmatch(r"[0-9a-f]{16}").all()
     # 같은 salt 면 같은 해시, 다른 salt 면 다른 해시 (매핑 표를 저장하지 않아도 한 실행 안에서는 일관)
     assert anon["lot"].equals(spc.anonymize_ids(df, ["lot"], salt=b"test")["lot"])
     assert not anon["lot"].equals(spc.anonymize_ids(df, ["lot"], salt=b"other")["lot"])
@@ -315,14 +355,87 @@ def test_anonymize_removes_original_ids_from_outputs(demo, tmp_path):
     assert "lot0" not in text and "lots" in text and len(alarms)
 
 
+def test_anonymize_detects_hash_collision(demo, monkeypatch):
+    """서로 다른 로트가 같은 해시가 되면 두 로트가 한 로트로 집계되므로 멈춘다 (1바이트로 줄여 충돌을 강제)."""
+    monkeypatch.setattr(spc, "ANON_DIGEST_SIZE", 1)                    # 256 값에 240 로트 → 충돌 거의 확실
+    with pytest.raises(ValueError, match="충돌"):
+        spc.anonymize_ids(demo["df"], ["lot"], salt=b"test")
+
+
+def test_anon_key_from_env_makes_ids_stable_across_runs(demo, monkeypatch):
+    """같은 사안의 초동·중간·종결 보고(별도 실행)가 같은 ID 를 쓰려면 환경변수 키. 없으면 실행마다 다르다."""
+    df = demo["df"]
+    monkeypatch.delenv(spc.ANON_KEY_ENV, raising=False)
+    assert spc.anon_key_from_env() is None
+    key, how = spc.resolve_anon_key(None)
+    assert key is None and "실행마다" in how
+    with pytest.raises(SystemExit):                                      # 명시한 변수가 없으면 조용히 무작위로 가지 않는다
+        spc.resolve_anon_key("WM811K_TEST_MISSING_KEY")
+    monkeypatch.setenv(spc.ANON_KEY_ENV, "case-2026-0042")
+    k1, how = spc.resolve_anon_key(None)
+    assert k1 is not None and spc.ANON_KEY_ENV in how
+    monkeypatch.setenv("OTHER_KEY", "case-2026-0042")
+    k2, _ = spc.resolve_anon_key("OTHER_KEY")
+    assert k1 == k2                                                      # 같은 값 → 같은 키 → 같은 ID
+    assert spc.anonymize_ids(df, ["lot"], k1)["lot"].equals(spc.anonymize_ids(df, ["lot"], k2)["lot"])
+    assert not spc.anonymize_ids(df, ["lot"], k1)["lot"].equals(spc.anonymize_ids(df, ["lot"])["lot"])   # 키 없음 = 무작위
+
+
 def test_main_demo_end_to_end(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(spc, "setup_korean_font", lambda: None)        # 폰트 없는 환경 → 그림만 en
+    monkeypatch.setenv(spc.ANON_KEY_ENV, "k")
     spc.main(["--demo", "--group-col", "chamber", "--event-col", "event", "--anonymize",
               "--output", str(tmp_path)])
     out = capsys.readouterr().out
     assert "발생률 관리도" in out and "영문(en)으로 전환" in out and "focus_ring_replaced" in out
+    assert f"로트 {spc.DEMO['n_groups']}개(로트당 {spc.DEMO['n']}장)" in out and "16자리" in out and spc.ANON_KEY_ENV in out
     for suffix in (".png", "_alarms.csv", "_subgroups.csv", "_report.md"):
         assert (tmp_path / f"spc_demo{suffix}").exists()
     a = pd.read_csv(tmp_path / "spc_demo_alarms.csv")
     assert not a["chart"].str.endswith("@A").any() and not a["chart"].str.endswith("@B").any()   # 그룹 ID 익명화
     assert {"acknowledged_at", "action", "verified_at"} <= set(a.columns)
+    # 같은 키로 다시 돌리면 같은 익명 ID (별도 실행끼리 alarms.csv 대조 가능)
+    spc.main(["--demo", "--group-col", "chamber", "--anonymize", "--output", str(tmp_path / "again")])
+    capsys.readouterr()
+    b = pd.read_csv(tmp_path / "again" / "spc_demo_alarms.csv")
+    assert set(a["chart"]) == set(b["chart"]) and set(a["lots"]) == set(b["lots"])
+
+
+def test_main_demo_report_separates_single_point_alarm_from_trend(tmp_path, capsys, monkeypatch):
+    """데모(시드 고정)에서 A 챔버 EDGE_RING 은 R1 1점 허위 알람, B 챔버는 지속 드리프트. 보고서가 둘을 다르게 쓴다."""
+    monkeypatch.setattr(spc, "setup_korean_font", lambda: None)
+    spc.main(["--demo", "--group-col", "chamber", "--output", str(tmp_path)])
+    out = capsys.readouterr().out
+    text = (tmp_path / "spc_demo_report.md").read_text(encoding="utf-8")
+    single = spc.LABELS["ko"]["r_single"]
+    sec_a = text.split("### EDGE_RING@A")[1].split("### ")[0]
+    sec_b = text.split("### EDGE_RING@B")[1].split("### ")[0]
+    assert single in sec_a and "점검 항목" not in sec_a
+    assert single not in sec_b and "점검 항목" in sec_b and "대조할 장비 측 로그" in sec_b
+    assert "| EDGE_RING@A |" in text and "1 (R1); 단발 |" in text and "연속" in text
+    assert f"EDGE_RING@A    [1 (R1); 단발] {single}" in out
+
+
+def test_main_predictions_csv_with_time_col_lot_subgroups_and_class_subset(tmp_path, capsys, monkeypatch):
+    """--demo 가 아닌 실제 입력 경로: --time-col 정렬, --subgroup lot(--min-size), --no-laney, --classes 부분집합, 파일 제목."""
+    monkeypatch.setattr(spc, "setup_korean_font", lambda: None)
+    titles: list[str] = []
+    orig = spc.plot_charts
+    monkeypatch.setattr(spc, "plot_charts", lambda *a, **k: titles.append(a[3]) or orig(*a, **k))
+    csv = tmp_path / "preds.csv"
+    spc.demo_predictions().iloc[::-1].to_csv(csv, index=False)          # 역순으로 저장 → --time-col 이 되돌려야 한다
+    spc.main([str(csv), "--time-col", "sample_id", "--subgroup", "lot", "--min-size", "50", "--no-laney",
+              "--classes", "EDGE_RING", "SCRATCH", "--output", str(tmp_path)])
+    out = capsys.readouterr().out
+    for suffix in (".png", "_alarms.csv", "_subgroups.csv", "_report.md"):
+        assert (tmp_path / f"spc_preds{suffix}").exists()
+    assert titles and "sorted by sample_id" in titles[0] and "preds.csv" in titles[0]
+    assert "기본 부분군 로트 병합 >=50장" in out and "Laney 과산포" not in out
+    sub = pd.read_csv(tmp_path / "spc_preds_subgroups.csv")
+    assert set(sub["chart"]) == {"EDGE_RING", "SCRATCH", "LOW_CONFIDENCE"}       # --classes 부분집합 + 저신뢰
+    assert (sub["n"] >= 50).all() and (sub["n"] % spc.DEMO["n"] == 0).all()      # 로트를 쪼개지 않고 합쳤다
+    assert (sub["wafer_end_idx"].diff().dropna() != 0).all()
+    report = (tmp_path / "spc_preds_report.md").read_text(encoding="utf-8")
+    assert "subgroup=lot>=50" in report and "Laney=off" in report and "preds.csv" in report
+    fd = spc.first_detection(pd.read_csv(tmp_path / "spc_preds_alarms.csv")).set_index(["chart", "rule"])["first_wafer_idx"]
+    assert 3000 <= fd[("EDGE_RING", "EWMA")] <= 4000                              # 시간 순으로 되돌렸으니 심은 시점 뒤에 잡힌다

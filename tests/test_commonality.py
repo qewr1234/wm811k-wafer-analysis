@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -206,3 +208,45 @@ def test_main_requires_history(tmp_path):
     pd.DataFrame({"lot": ["a"], "y_pred": ["EDGE_LOC"]}).to_csv(p, index=False)
     with pytest.raises(SystemExit):
         cm.main([str(p)])
+
+
+def test_main_no_overlapping_lots_exits_cleanly(planted, tmp_path):
+    """이력에 예측 로트가 하나도 없으면 traceback 이 아니라 한 줄 메시지의 sys.exit."""
+    p, h = tmp_path / "preds.csv", tmp_path / "nolots.lot_history.csv"
+    planted["preds"].to_csv(p, index=False)
+    hist = planted["hist"].copy()
+    hist["lot"] = "other_" + hist["lot"]
+    hist.to_csv(h, index=False)
+    with pytest.raises(SystemExit) as ex:
+        cm.main([str(p), "--history", str(h), "--pattern", "EDGE_LOC", "--output", str(tmp_path / "o")])
+    assert "겹치지" in str(ex.value) and str(ex.value).startswith("[오류]")
+    assert not (tmp_path / "o" / "commonality_EDGE_LOC.csv").exists()
+    r = subprocess.run([sys.executable, str(ROOT / "wm811k_commonality.py"), str(p), "--history", str(h),
+                        "--output", str(tmp_path / "o2")], capture_output=True, text=True, encoding="utf-8",
+                       cwd=tmp_path, env={**os.environ, "MPLBACKEND": "Agg"})
+    assert r.returncode == 1 and "Traceback" not in r.stderr and "겹치지" in r.stderr
+
+
+def test_anonymize_hides_tool_and_chamber_ids(planted, tmp_path):
+    res = cm.run(planted["preds"], planted["hist"], "EDGE_LOC", tmp_path, label="t", anonymize=True, salt=b"s")
+    t = res["table"]
+    assert not t["tool"].str.contains("ETCH|CVD|TRK|CLN").any() and t["tool"].str.fullmatch(r"[0-9a-f]{16}").all()
+    assert t["chamber"].str.fullmatch(r"[0-9a-f]{16}").all() and set(t["step"]) == {s for s, _ in cm.DEFAULT_STEPS}
+    text = (tmp_path / "commonality_EDGE_LOC_summary.txt").read_text(encoding="utf-8")
+    assert "ETCH-02" not in text and "L0000" not in text and "ids anonymized" in text
+    # 통계는 그대로다 (해시가 결합을 깨지 않는다): 심은 장비가 여전히 1위, 같은 n/q
+    plain = planted["table"].iloc[0]
+    top = t.iloc[0]
+    assert (top["n_lots"], top["n_bad"]) == (plain["n_lots"], plain["n_bad"]) and top["q_bh"] == pytest.approx(plain["q_bh"])
+    assert top["tool"] == cm.anonymize_ids(pd.DataFrame({"tool": ["ETCH-02"]}), ["tool"], b"s")["tool"].iloc[0]
+    # 빈 챔버는 빈 값으로 남는다
+    h2 = planted["hist"].drop(columns="chamber")
+    _, h2a = cm.anonymize_inputs(planted["preds"], cm.validate_history(h2, verbose=False), b"s")
+    assert (h2a["chamber"] == "").all() and "ETCH-02" not in set(h2a["tool"])
+    # CLI
+    p, h = tmp_path / "preds.csv", tmp_path / "x.lot_history.csv"
+    planted["preds"].to_csv(p, index=False)
+    planted["hist"].to_csv(h, index=False)
+    cm.main([str(p), "--history", str(h), "--anonymize", "--output", str(tmp_path / "a")])
+    csv_text = (tmp_path / "a" / "commonality_EDGE_LOC.csv").read_text(encoding="utf-8")
+    assert "ETCH-02" not in csv_text and "ETCH_M1" in csv_text

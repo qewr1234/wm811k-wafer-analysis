@@ -65,8 +65,10 @@ HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("WM811K_DIR", HERE / "data"))  # 환경변수 또는 스크립트 옆 data/
 CANDIDATES = ["wm811k_defects.pkl", "wm811k_labeled.pkl", "LSWMD.pkl"]
 
-# 실측 라벨 → 분류기 출력 클래스
-LABEL_MAP = {
+# 실측 라벨 → 분류기 출력 클래스. 결함 8종은 DEFECT_LABEL_MAP, none(정상) 까지가 LABEL_MAP.
+# 특징 테이블 스크립트(calibrate/structural/validate/improve)는 DEFECT_LABEL_MAP 만 쓴다
+# (none 행이 특징 테이블에 들어가면 분할·수치가 달라진다 - README 수치 불변 규칙).
+DEFECT_LABEL_MAP = {
     "Edge-Ring": "EDGE_RING",
     "Edge-Loc": "EDGE_LOC",
     "Center": "CENTER",
@@ -75,12 +77,13 @@ LABEL_MAP = {
     "Random": "RANDOM",
     "Donut": "DONUT",
     "Near-full": "NEAR_FULL",
-    "none": "CLEAN",
 }
+LABEL_MAP = {**DEFECT_LABEL_MAP, "none": "CLEAN"}
 MIN_DIE = 100          # 다이가 너무 적은 맵은 반경 통계가 불안정하다
 # macro-F1 계산에 쓰는 클래스. 교정 스크립트들과 동일하게 결함 8종으로 고정한다.
 CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
            "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
+DEFECT_CANDIDATES = ["wm811k_defects.pkl", "LSWMD.pkl"]   # 특징 테이블 스크립트의 기본 입력 후보
 LOT_SIZE_BINS = [(1, 1, "1장"), (2, 4, "2~4장"), (5, 10 ** 9, "5장 이상")]
 
 
@@ -90,34 +93,60 @@ def _unwrap(v):
     return str(a.reshape(-1)[0]) if a.size else None
 
 
+def find_data_file(data_dir: Path, names: list[str]) -> Path:
+    """data_dir 에서 names 순서로 첫 번째 존재하는 파일. 없으면 안내 후 종료."""
+    for name in names:
+        p = Path(data_dir) / name
+        if p.exists():
+            return p
+    sys.exit(f"데이터 파일을 찾을 수 없다. {list(names)} 중 하나를 "
+             f"{data_dir} 에 두거나 경로를 인자로 넘겨라.")
+
+
+def read_labeled_pkl(path: Path) -> pd.DataFrame:
+    """LSWMD 또는 추출본 pkl 을 읽어 ftype / lot / wafer_index 열을 붙인다. 행은 걸러내지 않는다.
+
+    ftype 은 failureType 의 (1,1) 포장을 벗긴 문자열(라벨 없음은 None), lot 은 lotName 문자열
+    (없으면 'unknown'), wafer_index 는 waferIndex 숫자(없으면 NaN; 식별용, 특징값에는 쓰지 않는다).
+    """
+    print(f"로드: {path.name}")
+    df = pd.read_pickle(path)
+    if "ftype" not in df.columns:
+        df["ftype"] = df["failureType"].apply(_unwrap)
+    df["lot"] = df["lotName"].astype(str) if "lotName" in df.columns else "unknown"
+    df["wafer_index"] = (pd.to_numeric(df["waferIndex"], errors="coerce")
+                         if "waferIndex" in df.columns else np.nan)
+    return df
+
+
+def load_defect_frame(path: Path | None, data_dir: Path = DATA_DIR) -> pd.DataFrame:
+    """특징 테이블 스크립트 공용 로더: 결함 8종 라벨 행만 남기고 y_true 를 붙인다.
+
+    path 가 None 이면 data_dir 의 DEFECT_CANDIDATES 를 찾는다. 행 순서는 파일 순서 그대로라
+    (로트 등장 순서가 lot_split 의 난수 선택을 정한다) 어떤 스크립트에서 불러도 같은 분할이 나온다.
+    """
+    if path is None:
+        path = find_data_file(data_dir, DEFECT_CANDIDATES)
+    df = read_labeled_pkl(path)
+    df = df[df["ftype"].isin(DEFECT_LABEL_MAP)].copy()
+    df["y_true"] = df["ftype"].map(DEFECT_LABEL_MAP)
+    return df
+
+
+def skipped_note(n_total: int, n_skip: int, first_error: str | None) -> str:
+    """특징 추출 루프가 건너뛴 장수 요약. 학습에 실제로 쓰인 장수를 로그에 남기기 위한 것."""
+    note = f"라벨 {n_total}장 중 제외 {n_skip}장 (MIN_DIE {MIN_DIE} 미만 또는 예외)"
+    return note + (f"; 첫 예외: {first_error}" if first_error else "")
+
+
 def load_data(path: Path | None = None, include_none: bool = False) -> pd.DataFrame:
     """LSWMD 또는 미리 추출한 pkl을 읽어 waferMap/ftype/lot/wafer_index 만 남긴다.
 
     wafer_index 는 waferIndex 열이 있으면 숫자로, 없으면 NaN.
     """
     if path is None:
-        for name in CANDIDATES:
-            p = DATA_DIR / name
-            if p.exists():
-                path = p
-                break
-        else:
-            sys.exit(f"데이터 파일을 찾을 수 없다. {CANDIDATES} 중 하나를 "
-                     f"{DATA_DIR} 에 두거나 경로를 인자로 넘겨라.")
-
-    print(f"로드: {path.name}")
-    df = pd.read_pickle(path)
-
-    if "ftype" not in df.columns:
-        df["ftype"] = df["failureType"].apply(_unwrap)
-    if "lotName" in df.columns:
-        df["lot"] = df["lotName"].astype(str)
-    else:
-        df["lot"] = "unknown"
-    if "waferIndex" in df.columns:
-        df["wafer_index"] = pd.to_numeric(df["waferIndex"], errors="coerce")
-    else:
-        df["wafer_index"] = np.nan
+        path = find_data_file(DATA_DIR, CANDIDATES)
+    df = read_labeled_pkl(path)
 
     df = df[df["ftype"].notna()].copy()
     if not include_none:
@@ -227,8 +256,8 @@ def report(res: pd.DataFrame, title: str) -> dict:
                                 zero_division=0))
 
     cm = confusion_matrix(y_true, y_pred, labels=labels)
-    cm_df = pd.DataFrame(cm, index=[f"실제 {l}" for l in labels],
-                         columns=[f"→{l}" for l in labels])
+    cm_df = pd.DataFrame(cm, index=[f"실제 {c}" for c in labels],
+                         columns=[f"→{c}" for c in labels])
     print("Confusion matrix (행=실제, 열=예측)")
     print(cm_df.to_string())
 

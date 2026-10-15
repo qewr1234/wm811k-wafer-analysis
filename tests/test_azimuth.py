@@ -165,6 +165,59 @@ def test_load_records_merges_predictions(tmp_path):
     rec = az.load_records(pkl, tmp_path / "pred.csv")
     assert len(rec) == 5 and set(rec["y_pred"]) == {"LOC"} and "confidence" in rec.columns
     assert az.label_column(rec) == "y_pred"
+    # 예측에 confidence 가 없으면 열을 만들지 않는다
+    pred.drop(columns="confidence").to_csv(tmp_path / "pred_nc.csv", index=False)
+    assert "confidence" not in az.load_records(pkl, tmp_path / "pred_nc.csv").columns
+
+
+def test_load_records_partial_wafer_index_nan_and_row_mismatch(tmp_path, capsys):
+    """records 20장 중 한 로트 3장만 waferIndex 결측 + 예측 행 수 불일치 - 예전엔 통째로 실패했다."""
+    rng = np.random.default_rng(4)
+    rows = []
+    for lot, n in (("lotA", 9), ("lotB", 8), ("lotG", 3)):
+        for w in range(n):
+            rows.append({"waferMap": make_wafermap("loc", 100 * len(rows) + w, rng), "lotName": lot,
+                         "waferIndex": None if lot == "lotG" else w, "failureType": np.array([["Loc"]])})
+    pkl = tmp_path / "rec.pkl"
+    pd.DataFrame(rows).to_pickle(pkl)
+    pred = pd.DataFrame({"lot": ["lotA"] * 9 + ["lotB"] * 8 + ["lotG"] * 3 + ["lotZ"] * 2,
+                         "wafer_index": list(range(9)) + list(range(8)) + [np.nan] * 3 + [0, 1],
+                         "y_pred": ["EDGE_LOC"] * 22})
+    pred.to_csv(tmp_path / "pred.csv", index=False)
+    rec = az.load_records(pkl, tmp_path / "pred.csv")                # 22 vs 20 행인데도 결합된다
+    out = capsys.readouterr().out
+    assert len(rec) == 20 and set(rec["y_pred"]) == {"EDGE_LOC"}
+    assert rec.loc[rec["lot"] == "lotG", "wafer_index"].isna().all()
+    assert "키 결합 17장, 순서 결합 3장" in out and "예측 2행 무시" in out and "records 3장 / 예측 3행" in out
+    # 로트 안 행 수까지 다르면 그 로트만 빠지고 나머지는 산다
+    pred2 = pred[~((pred["lot"] == "lotG") & (pred["wafer_index"].isna()) & (pred.index == pred.index[-3]))]
+    pred2.to_csv(tmp_path / "pred2.csv", index=False)
+    rec = az.load_records(pkl, tmp_path / "pred2.csv", verbose=False)
+    assert len(rec) == 17 and "lotG" not in set(rec["lot"])
+    # 아무 로트도 결합되지 않으면 결측 장수·행 수를 정확히 말하며 실패한다 ('wafer_index 가 없고' 가 아니다)
+    pred3 = pd.DataFrame({"lot": ["lotA"] * 3, "wafer_index": [np.nan] * 3, "y_pred": ["LOC"] * 3})
+    pred3.to_csv(tmp_path / "pred3.csv", index=False)
+    with pytest.raises(ValueError, match=r"records 3장, 예측 3행.*예측 3 vs records 20"):
+        az.load_records(pkl, tmp_path / "pred3.csv")
+
+
+def test_join_predictions_two_stage():
+    rec = pd.DataFrame({"waferMap": [None] * 5, "lot": ["A", "A", "A", "B", "B"], "wafer_index": [1, 2, 3, np.nan, np.nan]})
+    p = pd.DataFrame({"lot": ["A", "A", "A", "B", "B", "C"], "wafer_index": [3, 1, np.nan, np.nan, np.nan, 1],
+                      "y_pred": ["a3", "a1", "ax", "b1", "b2", "c"], "confidence": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]})
+    out, info = az.join_predictions(rec, p)
+    assert out["y_pred"].tolist() == ["a1", "ax", "a3", "b1", "b2"]            # A: 키 2 + 순서 1, B: 순서 2
+    assert out["confidence"].tolist() == [0.2, 0.3, 0.1, 0.4, 0.5]
+    assert info["n_keyed"] == 2 and info["n_ordered"] == 3 and info["n_pred_unused"] == 1 and info["lots_unmatched"] == []
+    assert "순서 결합 3장" in az.join_note(info)
+    assert az.join_note({**info, "n_pred_unused": 0, "n_ordered": 0}) == ""             # 전부 키 결합이면 조용하다
+    assert "순서 결합" in az.join_note({**info, "n_pred_unused": 0})                     # 순서 결합은 가정이라 알린다
+    # 예측 쪽 중복 키는 첫 행, records 중복 키도 첫 행만 받는다
+    out, info = az.join_predictions(rec.iloc[:3], pd.DataFrame({"lot": "A", "wafer_index": [1, 1], "y_pred": ["p", "q"]}))
+    assert out["y_pred"].tolist() == ["p", np.nan, np.nan] or (out["y_pred"].iloc[0] == "p" and out["y_pred"].isna().sum() == 2)
+    assert info["n_unmatched"] == 2 and info["n_pred_unused"] == 1
+    with pytest.raises(ValueError, match="lot, y_pred"):
+        az.join_predictions(rec, p.drop(columns="y_pred"))
 
 
 def test_rose_plot_and_cli_demo(tmp_path):

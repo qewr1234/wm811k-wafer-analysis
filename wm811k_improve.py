@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -40,10 +41,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy import ndimage
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import confusion_matrix, f1_score
 
-from wm811k_structural import CLASSES, LABEL_MAP, MIN_DIE, structural_features
+from wm811k_evaluate import load_defect_frame, skipped_note
+from wm811k_structural import CLASSES, MIN_DIE, structural_features
 from wm811k_validate import (
     FEATS_B, SEEDS, auc_ovr, largest_component_features, lot_split, macro_f1,
     make_rf,
@@ -130,34 +132,23 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
         print(f"캐시 사용: {CACHE3}")
         return pd.read_csv(CACHE3)
 
-    if path is None:
-        for name in ["wm811k_defects.pkl", "LSWMD.pkl"]:
-            if (DATA_DIR / name).exists():
-                path = DATA_DIR / name
-                break
-        else:
-            sys.exit(f"데이터 파일을 찾을 수 없다. {DATA_DIR} 에 wm811k_defects.pkl 이 있어야 한다.")
-
-    print(f"로드: {path.name}")
-    df = pd.read_pickle(path)
-    if "ftype" not in df.columns:
-        df["ftype"] = df["failureType"].apply(
-            lambda v: str(np.asarray(v).reshape(-1)[0]) if np.asarray(v).size else None)
-    df["lot"] = (df["lotName"] if "lotName" in df.columns else "unknown").astype(str)
-    df = df[df["ftype"].isin(LABEL_MAP)].copy()
-    df["y_true"] = df["ftype"].map(LABEL_MAP)
+    df = load_defect_frame(path, DATA_DIR)
 
     recs, t0 = [], time.time()
+    n_skip, first_err = 0, None
     for i, (wmap, y, lot) in enumerate(zip(df["waferMap"], df["y_true"], df["lot"])):
         arr = np.asarray(wmap)
         if arr.ndim != 2 or (arr > 0).sum() < MIN_DIE:
+            n_skip += 1
             continue
         try:
             r = classify_wafer_pattern(wafermap_to_df(arr))
             st = structural_features(arr)
             nf = largest_component_features(arr)
             rb = robust_features(arr)
-        except Exception:
+        except Exception as e:                   # 퇴화된 맵 방어. 건수는 끝에 보고한다
+            n_skip += 1
+            first_err = first_err or f"{type(e).__name__}: {e}"
             continue
         recs.append({
             "y_true": y, "lot": lot,
@@ -170,7 +161,8 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
             print(f"  {i + 1}/{len(df)} ({time.time() - t0:.0f}s)")
     out = pd.DataFrame(recs)
     out.to_csv(CACHE3, index=False, encoding="utf-8-sig")
-    print(f"저장: {CACHE3} ({len(out)}행, 특징 {len(FEATS_ALL)}개)")
+    print(f"저장: {CACHE3} ({len(out)}행, 특징 {len(FEATS_ALL)}개; "
+          f"{skipped_note(len(df), n_skip, first_err)})")
     return out
 
 
@@ -224,7 +216,7 @@ def main(path: Path | None = None):
     }).round(3)
     print(tab.to_string())
 
-    print(f"\n  겨냥한 혼동 — EDGE_LOC vs LOC / SCRATCH vs LOC (AUC)")
+    print("\n  겨냥한 혼동 - EDGE_LOC vs LOC / SCRATCH vs LOC (AUC)")
     el, lo, sc = (F[F["y_true"] == c] for c in ("EDGE_LOC", "LOC", "SCRATCH"))
     print(f"  {'특징':15s} {'EDGE_LOC|LOC':>13s} {'SCRATCH|LOC':>12s}")
     for f in ROBUST_FEATURES + ["big_r", "big_r_min", "elongation"]:
@@ -232,7 +224,7 @@ def main(path: Path | None = None):
               f"{auc_ovr(sc[f].to_numpy(), lo[f].to_numpy()):12.3f}")
 
     # ── 로트 분할 5회, 4개 모델 짝지어 비교 ──
-    print(f"\n{'=' * 74}\n로트 분할 {len(SEEDS)}회 반복 (시드 {SEEDS}) — test macro-F1\n{'=' * 74}")
+    print(f"\n{'=' * 74}\n로트 분할 {len(SEEDS)}회 반복 (시드 {SEEDS}) - test macro-F1\n{'=' * 74}")
     y = F["y_true"].to_numpy()
     X = {nm: F[feats].to_numpy() for nm, (_, feats) in MODELS.items()}
     res = {nm: [] for nm in MODELS}
@@ -258,7 +250,7 @@ def main(path: Path | None = None):
     res = {nm: np.array(v) for nm, v in res.items()}
     print()
     print(paired_table(res).round(4).to_string())
-    print("\n  train−test 격차 평균: " +
+    print("\n  train-test 격차 평균: " +
           "  ".join(f"{nm} {np.mean(g):+.3f}" for nm, g in gaps.items()))
     print("  → 채택 기준: 5회 모두 개선이고 Δ가 기준 모델의 표준편차보다 클 것.")
 
@@ -284,5 +276,15 @@ def main(path: Path | None = None):
     print(f"\n저장: {HERE / 'wm811k_improve_results.csv'}\n      {CACHE3}")
 
 
+def _cli(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="WM-811K 노이즈에 강건한 구조 특징 8개 추가 + RF/HGB 비교 "
+                    f"(로트 분할 {len(SEEDS)}회, 시드 {SEEDS})")
+    ap.add_argument("path", nargs="?", type=Path, default=None,
+                    help="wm811k_defects.pkl 경로 (기본: WM811K_DIR 또는 data/). "
+                         f"특징 캐시 {CACHE3.name} 가 스크립트 옆에 있으면 그것을 쓴다")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    main(Path(sys.argv[1]) if len(sys.argv) > 1 else None)
+    main(_cli().path)

@@ -67,6 +67,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# 입력 결합(load_records -> join_predictions)과 CLI 뼈대(run / demo_records / main)는 wm811k_azimuth 와 같은
+# 이름이지만 이 모듈의 run 은 스크래치 표·그림을 낸다(입력 형식이 다르다). 모듈 밖에서는 모듈명을 붙여 쓴다.
 from wm811k_azimuth import (
     DEFAULT_NOTCH_DEG, label_column, largest_component_xy, load_records,
     notch_relative_angle, rayleigh_test,
@@ -329,7 +331,8 @@ def plot_scratch_fit(arr: np.ndarray, ax=None, title: str = "", notch_deg: float
     elif s["shape"] == "arc":
         sub += f"\nr={s['arc_r_norm']:.2f}R  center {'outside' if s['arc_center_outside'] else 'inside'}"
     ax.set_title(f"{title}\n{sub}" if title else sub, fontsize=8)
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_yticks([])
     return ax
 
 

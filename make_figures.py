@@ -8,34 +8,42 @@
 #   전부 빈 사각형으로 깨졌다. 이 스크립트는 문서용 그림을 한 명령으로, 동봉 폰트(_fonts.py)로,
 #   같은 크기·해상도 규칙으로 다시 만든다.
 #
-# 무엇을 하나 (전부 합성 데이터; 각 파일 500KB 이하, dpi 110~130, 캡션에 '합성' 표시)
+# 무엇을 하나 (전부 합성 데이터; 각 파일 500KB 이하, PNG dpi 120~130, 캡션에 '합성' 표시)
 #   patterns        docs/img/wafer_patterns_synthetic.png   합성 8종 2x4 격자 (tests/synthetic_wm811k.make_wafermap)
 #   spc             docs/img/spc_demo.png                   wm811k_spc.py --demo 관리도
 #   spc_chamber     docs/img/spc_demo_chamber.png           --group-col chamber --event-col event 버전
-#   pipeline        docs/img/pipeline.svg                   흐름도 (한글은 글리프를 경로로 묻어 폰트 없는 환경에서도 깨지지 않음)
+#   pipeline        docs/img/pipeline.svg                   흐름도 (한글은 글리프를 경로로 묻어 폰트 없는 환경에서도 깨지지 않음;
+#                                                           <title>/<desc> 로 대체 텍스트를 넣는다)
 #   service_report  docs/img/service_report_page.png        batch_wafer_report 의 서비스 리포트 1페이지
 #   lot_report      docs/img/lot_report_page.png            wm811k_lot_report --demo PDF 의 1페이지
 #   sample_pdf      docs/samples/batch_wafer_report_sample.pdf   로트 3개 x 웨이퍼 2장, 서비스 리포트 전부 첨부
 #                   docs/samples/lot_report_sample.pdf           합성 로트 1개의 로트 트러블슈팅 리포트
-#   readme          docs/img/README.md                      그림별 생성 명령과 '합성 데이터' 명시
+#   readme          docs/img/README.md                      그림별 생성 명령·대체 텍스트와 '합성 데이터' 명시 (항상 한국어)
 #
 # 왜
 #   - 그림을 손으로 만들면 코드가 바뀌어도 그림이 안 바뀐다. 스크립트로 묶어 두면 관리도 규칙이나
 #     보고서 양식이 바뀔 때 한 번에 다시 만들고, 그림과 코드가 어긋나는 일이 없다.
 #   - PNG 는 dpi 를 고정하고 500KB 를 넘으면 256색 팔레트로 줄인다(선·글자 위주 그림이라 손실이 없다).
 #   - SVG 는 svg.fonttype='path' 로 글자를 경로로 저장한다. GitHub 뷰어나 폰트 없는 PC 에서도
-#     한글이 그대로 보인다(대신 파일이 커진다).
+#     한글이 그대로 보인다(대신 파일이 커진다). 글자가 경로라 검색·스크린리더가 못 읽으므로
+#     <title>/<desc> 를 따로 넣는다.
+#   - 재현 가능한 산출물: 같은 코드로 두 번 돌리면 바이트까지 같아야 커밋 diff 가 '그림이 바뀐 것'만
+#     남는다. 그래서 생성 시각을 FIXED_EPOCH(2026-01-01 00:00 UTC)로 고정한다 - matplotlib 는
+#     SOURCE_DATE_EPOCH 로 PDF CreationDate·SVG dc:date 를, batch_wafer_report 는 같은 변수로 생성일시를,
+#     wm811k_lot_report 는 이 스크립트가 시계를 바꿔 끼워(_frozen_clock) 각주 시각을 고정한다.
 #
 # 한계
 #   전부 합성 데이터다. 그림 속 일치율·탐지 시점·판정은 로직 확인이지 성능이 아니다. 실측 수치는
 #   README 의 WM-811K 결과(macro-F1 0.907 +- 0.008)뿐이고, 이 스크립트는 그 수치를 만들지 않는다.
 #   lot_report 페이지의 PNG 변환은 pypdfium2 -> pdftoppm -> (둘 다 없으면) PdfPages 를 가로채
 #   첫 페이지 figure 를 저장하는 순서로 시도한다. 한글 폰트가 없으면 영문(en)으로 자동 전환한다.
+#   바이트 동일성은 같은 환경(matplotlib·폰트·래스터라이저)에서의 이야기다. 환경이 다르면 글리프
+#   렌더링이 달라 PNG 바이트가 달라질 수 있다.
 #
 # 사용법
 #   python make_figures.py                                  # 전부 (ko)
 #   python make_figures.py --only patterns pipeline         # 일부만
-#   python make_figures.py --lang en                        # 영문판 (파일명에 _en 접미사)
+#   python make_figures.py --lang en                        # 영문판 (파일명에 _en 접미사; readme 는 항상 한국어)
 #   python make_figures.py --img-dir out/img --samples-dir out/samples   # 출력 폴더 변경 (테스트용)
 
 from __future__ import annotations
@@ -43,13 +51,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import warnings
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -70,6 +79,13 @@ SAMPLES_DIR = HERE / "docs" / "samples"
 DPI = 120
 MAX_BYTES = 500_000
 GLYPH_WARNING = "missing from font"
+# 산출물에 찍히는 생성 시각(고정): 2026-01-01 00:00 UTC. 같은 코드 -> 같은 바이트.
+FIXED_EPOCH = 1_767_225_600
+FIXED_TIME = datetime.fromtimestamp(FIXED_EPOCH, tz=timezone.utc)
+# 합성 8종 중 패널별로 시드를 따로 고르는 것. LOC 는 기본 시드(seed + i)에서 15x15 격자에 배경 무작위
+# 불량이 덩어리처럼 보여 '한 곳의 덩어리' 라는 정의와 어긋나 보였다. 832 는 23x23 격자에 덩어리 1개 +
+# 희박한 배경(생성기·특징·스냅샷 테스트는 그대로; 그림 선택만 바꾼 것).
+PANEL_SEED = {"loc": 832}
 
 # 색은 wafer_map_visualizer / wm811k_spc 와 맞춘다.
 INK, MUTED, LINE, BG = "#455A64", "#78909C", "#B0BEC5", "#ECEFF1"
@@ -109,7 +125,9 @@ TEXT = {
             ("보고", "서비스 리포트 · 로트 리포트 ·\n8D 케이스 스터디", "batch_wafer_report · wm811k_lot_report", "report"),
         ],
         "legend": [("data", "입력"), ("model", "분석"), ("field", "현장 판정"), ("report", "산출물")],
-        "img_readme_title": "# docs/img - 문서용 그림 (전부 합성 데이터)",
+        "pipeline_alt": ("웨이퍼 맵에서 보고서까지 8단계 흐름도: 1 웨이퍼 맵 -> 2 분류 -> 3 패턴 8종 -> 4 로트 안 판정 -> "
+                         "5 장비 측 증거 대조 -> 6 TEL 원인 / 타사 인계 -> 7 SPC 추세·이벤트 -> 8 보고, "
+                         "그리고 8 에서 7 로 '조치 후 관리도 복귀 확인' 점선"),
         "font_none": "[경고] 한글 폰트를 찾지 못해 영문(en)으로 전환한다.",
     },
     "en": {
@@ -132,7 +150,9 @@ TEXT = {
             ("Report", "service report · lot report ·\n8D case study", "batch_wafer_report · wm811k_lot_report", "report"),
         ],
         "legend": [("data", "input"), ("model", "analysis"), ("field", "field judgement"), ("report", "deliverable")],
-        "img_readme_title": "# docs/img - figures for the docs (all synthetic data)",
+        "pipeline_alt": ("Eight-step flow from a wafer map to a report: 1 wafer map -> 2 classify -> 3 eight patterns -> "
+                         "4 within-lot checks -> 5 tool-side evidence -> 6 TEL cause / hand-off -> 7 SPC trend and events -> "
+                         "8 report, plus a dashed loop from 8 back to 7 'confirm the chart returns to baseline after the action'"),
         "font_none": "[warning] Korean font not found - switching to en.",
     },
 }
@@ -143,6 +163,46 @@ TEXT = {
 # ──────────────────────────────────────────
 def _suffix(lang: str) -> str:
     return "" if lang == "ko" else f"_{lang}"
+
+
+@contextlib.contextmanager
+def _reproducible():
+    """SOURCE_DATE_EPOCH 를 FIXED_EPOCH 로 두고(이미 있으면 그대로) 끝나면 되돌린다.
+
+    matplotlib 는 이 변수로 PDF CreationDate 와 SVG dc:date 를, batch_wafer_report._now 는 생성일시를 고정한다.
+    """
+    key = "SOURCE_DATE_EPOCH"
+    old = os.environ.get(key)
+    if old is None:
+        os.environ[key] = str(FIXED_EPOCH)
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+
+
+@contextlib.contextmanager
+def _frozen_clock(module, at: datetime = FIXED_TIME):
+    """module 의 datetime.now() 가 at 을 돌려주게 바꿔 끼운다(wm811k_lot_report 의 각주 시각·CreationDate용).
+
+    wm811k_lot_report.render_lot_pdf 는 report_time 인자가 없어 datetime.now() 를 직접 부른다. 그 모듈을
+    고치지 않고 산출물을 재현 가능하게 하려는 임시 수단이며, 모듈이 SOURCE_DATE_EPOCH 를 보게 되면 뺀다.
+    """
+    real = module.datetime
+
+    class _Frozen(real):                                  # type: ignore[misc,valid-type]
+        @classmethod
+        def now(cls, tz=None):
+            return at if tz is None else at.astimezone(tz)
+
+    module.datetime = _Frozen
+    try:
+        yield
+    finally:
+        module.datetime = real
 
 
 def fit_png_size(path: Path, max_bytes: int = MAX_BYTES) -> int:
@@ -203,7 +263,9 @@ def make_patterns(img_dir: Path, lang: str, dpi: int = DPI, seed: int = 2026) ->
     rng = np.random.default_rng(seed)
     fig, axes = plt.subplots(2, 4, figsize=(12.0, 7.0), layout="constrained")
     for i, (ax, (mode, cls, ko, en)) in enumerate(zip(axes.ravel(), PATTERNS)):
-        arr = make_wafermap(mode, seed + i, rng)
+        arr = make_wafermap(mode, seed + i, rng)          # 공유 rng 는 항상 같은 순서로 소비(다른 패널은 불변)
+        if mode in PANEL_SEED:                            # 패널 전용 시드로 다시 만든다
+            arr = make_wafermap(mode, PANEL_SEED[mode], np.random.default_rng(PANEL_SEED[mode]))
         die = arr > 0
         ff = float((arr == 2).sum() / max(die.sum(), 1))
         _draw_map(ax, arr)
@@ -309,13 +371,29 @@ def pipeline_figure(lang: str) -> plt.Figure:
     return fig
 
 
+def _xml_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def add_svg_alt(svg: str, title: str, desc: str) -> str:
+    """<svg ...> 바로 뒤에 <title>/<desc> 를 넣는다(글자가 경로라 스크린리더·검색이 못 읽는 것의 대체 텍스트)."""
+    i = svg.index("<svg")
+    j = svg.index(">", i) + 1
+    return svg[:j] + f"\n <title>{_xml_escape(title)}</title>\n <desc>{_xml_escape(desc)}</desc>" + svg[j:]
+
+
 def make_pipeline(img_dir: Path, lang: str, dpi: int = DPI) -> list[Path]:
+    T = TEXT[lang]
     fig = pipeline_figure(lang)
     out = img_dir / f"pipeline{_suffix(lang)}.svg"
     out.parent.mkdir(parents=True, exist_ok=True)
-    with matplotlib.rc_context({"svg.fonttype": "path"}):     # 글자를 경로로: 뷰어에 폰트가 없어도 그대로
-        fig.savefig(out, format="svg", facecolor="white")
+    buf = io.StringIO()
+    # fonttype=path: 글자를 경로로(뷰어에 폰트가 없어도 그대로). hashsalt: clip-path id 가 uuid4 가 아니라
+    # 고정 salt 의 해시가 되어 두 번 저장해도 바이트가 같다.
+    with matplotlib.rc_context({"svg.fonttype": "path", "svg.hashsalt": "wm811k-wafer-analysis"}):
+        fig.savefig(buf, format="svg", facecolor="white")
     plt.close(fig)
+    out.write_text(add_svg_alt(buf.getvalue(), T["pipeline_title"], T["pipeline_alt"]), encoding="utf-8")
     return [out]
 
 
@@ -340,7 +418,7 @@ def make_service_report(img_dir: Path, lang: str, dpi: int = DPI) -> list[Path]:
     import batch_wafer_report as bwr
     lang = bwr.resolve_lang(lang, quiet=True)
     lot = _synthetic_lot("SYN_LOT_RING_001", "ring", 3, seed=42)
-    fig = bwr.build_service_report_page(lot, lang=lang, report_time=datetime.now().strftime("%Y-%m-%d"))
+    fig = bwr.build_service_report_page(lot, lang=lang, report_time=FIXED_TIME.strftime("%Y-%m-%d"))
     return [_save_png(fig, img_dir / f"service_report_page{_suffix(lang)}.png", dpi)]
 
 
@@ -373,7 +451,8 @@ def _lot_demo(lang: str, out_pdf: Path, capture_png: Path | None = None, dpi: in
     records, preds, hist = lr.demo_records()
     f = lr.analyze_lot(records, preds, lr.DEMO_LOTS[0], history=hist, synthetic=True)
     if capture_png is None:
-        lr.render_lot_pdf(f, records, out_pdf, lang=lang, quiet=True)
+        with _frozen_clock(lr):
+            lr.render_lot_pdf(f, records, out_pdf, lang=lang, quiet=True)
         return f
     real = lr.PdfPages
 
@@ -388,7 +467,8 @@ def _lot_demo(lang: str, out_pdf: Path, capture_png: Path | None = None, dpi: in
 
     lr.PdfPages = _Capture
     try:
-        lr.render_lot_pdf(f, records, out_pdf, lang=lang, quiet=True)
+        with _frozen_clock(lr):
+            lr.render_lot_pdf(f, records, out_pdf, lang=lang, quiet=True)
     finally:
         lr.PdfPages = real
     return f
@@ -437,30 +517,47 @@ def make_sample_pdf(samples_dir: Path, lang: str, work: Path, dpi: int = DPI) ->
 # ──────────────────────────────────────────
 # 8. docs/img/README.md
 # ──────────────────────────────────────────
+# (파일명, --only 이름, 대체 텍스트(그림을 못 보는 독자용 한 줄), 내용)
 README_ROWS = [
-    ("wafer_patterns_synthetic.png", "patterns", "합성 웨이퍼 맵 8종 2x4 격자 (`tests/synthetic_wm811k.make_wafermap`). 노치는 아래(가정 notch_deg=-90)."),
-    ("spc_demo.png", "spc", "`python wm811k_spc.py --demo` 의 관리도. 웨이퍼 3000부터 EDGE_RING 드리프트, 3750부터 저신뢰 증가, 4125부터 SCRATCH 계단을 심은 합성 시퀀스."),
-    ("spc_demo_chamber.png", "spc_chamber", "같은 데모를 `--group-col chamber --event-col event` 로 층화한 것. 심은 이상은 B 챔버에만 있고 이벤트(pm_wet_clean, focus_ring_replaced)가 세로 점선."),
-    ("pipeline.svg", "pipeline", "흐름도. 글자를 경로로 저장해 폰트 없는 환경에서도 한글이 보인다."),
-    ("service_report_page.png", "service_report", "`batch_wafer_report.build_service_report_page` 의 서비스 리포트 양식 1페이지 (합성 링 로트 3장). Tool/Chamber 는 빈 양식."),
-    ("lot_report_page.png", "lot_report", "`python wm811k_lot_report.py --demo` 가 만드는 PDF(demo_edge_loc_fixed)의 1페이지."),
+    ("wafer_patterns_synthetic.png", "patterns",
+     "합성 웨이퍼 맵 8종을 2x4 로 늘어놓은 격자: 엣지 링, 센터, 도넛, 엣지 국소, 스크래치, 국소, 무작위, 전면 불량. 초록 PASS, 빨강 FAIL, 아래 삼각형 노치",
+     "합성 웨이퍼 맵 8종 2x4 격자 (`tests/synthetic_wm811k.make_wafermap`). 노치는 아래(가정 notch_deg=-90). LOC 패널은 덩어리 1개가 보이는 시드를 따로 골랐다(`PANEL_SEED`)."),
+    ("spc_demo.png", "spc",
+     "패턴별 p 관리도 8개를 세로로 쌓은 그림. EDGE_RING 은 웨이퍼 3000부터 드리프트, SCRATCH 는 4125부터 계단, 저신뢰 비율은 3750부터 증가하며 알람 점이 표시된다",
+     "`python wm811k_spc.py --demo` 의 관리도. 웨이퍼 3000부터 EDGE_RING 드리프트, 3750부터 저신뢰 증가, 4125부터 SCRATCH 계단을 심은 합성 시퀀스."),
+    ("spc_demo_chamber.png", "spc_chamber",
+     "챔버 A/B 로 층화한 관리도 11개. B 챔버 관리도에만 드리프트·계단이 있고 이벤트(pm_wet_clean, focus_ring_replaced)가 세로 점선으로 표시된다. 세로로 길어 docs/img 에서 원본 크기로 볼 것",
+     "같은 데모를 `--group-col chamber --event-col event` 로 층화한 것. 심은 이상은 B 챔버에만 있고 이벤트(pm_wet_clean, focus_ring_replaced)가 세로 점선. 1560x3016 으로 세로로 길다."),
+    ("pipeline.svg", "pipeline",
+     "8단계 흐름도: 웨이퍼 맵 -> 분류 -> 패턴 8종 -> 로트 안 판정 -> 장비 측 증거 대조 -> TEL 원인 / 타사 인계 -> SPC 추세·이벤트 -> 보고, 8 에서 7 로 되돌아가는 점선",
+     "흐름도. 글자를 경로로 저장해 폰트 없는 환경에서도 한글이 보인다. 같은 대체 텍스트가 SVG `<title>`/`<desc>` 에 들어 있다."),
+    ("service_report_page.png", "service_report",
+     "A4 세로 서비스 리포트 양식 1장: 머리 표(장비·챔버·로트·일자·심각도·영향 범위·봉쇄 조치 제안·보고 단계·다음 보고 예정), 현상, 분류 결과, 의심 원인 순위, 권고 조치, 후속 확인(SPC 알람 해제 기준), 증거 체크박스, 비고 빈 줄, 서명란",
+     "`batch_wafer_report.build_service_report_page` 의 서비스 리포트 양식 1페이지 (합성 링 로트 3장). Tool/Chamber 는 빈 양식. 머리 표는 `docs/handoff.md` 2절 초동 보고 항목과 1:1."),
+    ("lot_report_page.png", "lot_report",
+     "로트 트러블슈팅 리포트 1페이지: 로트 헤더(웨이퍼 수·평균 불량률·지배 패턴·저신뢰 장수·OCAP 레벨), 패턴 믹스 막대, 웨이퍼 썸네일 8장(슬롯 순), 방위각 로즈와 fixed_angle 판정",
+     "`python wm811k_lot_report.py --demo` 가 만드는 PDF(demo_edge_loc_fixed)의 1페이지."),
 ]
 
 
-def make_readme(img_dir: Path, lang: str) -> list[Path]:
-    T = TEXT[lang]
-    lines = [T["img_readme_title"], "",
+def make_readme(img_dir: Path) -> list[Path]:
+    """docs/img/README.md. 그림 설명은 한국어 한 벌만 둔다(--lang en 이어도 이 파일은 바뀌지 않는다)."""
+    lines = ["# docs/img - 문서용 그림 (전부 합성 데이터)", "",
              "이 폴더의 그림은 **전부 합성 데이터**로 `python make_figures.py` 가 만든다. "
              "그림 속 일치율·탐지 시점·판정은 로직 확인이지 성능이 아니다. 실측 수치는 README 의 WM-811K 결과뿐이다. "
              "실제 장비·고객 데이터는 없고, Tool/Chamber 같은 식별자는 빈 양식이다.", "",
-             "| 파일 | 생성 (`python make_figures.py --only <name>`) | 내용 |", "|---|---|---|"]
-    for fname, name, desc in README_ROWS:
-        lines.append(f"| `{fname}` | `{name}` | {desc} |")
+             "| 파일 | 생성 (`python make_figures.py --only <name>`) | 대체 텍스트 | 내용 |", "|---|---|---|---|"]
+    for fname, name, alt, desc in README_ROWS:
+        lines.append(f"| `{fname}` | `{name}` | {alt} | {desc} |")
+    lines.append("| `*_en.png`, `pipeline_en.svg` | 위 이름 + `--lang en` | 같은 그림의 영문판(제목·캡션만 영문, 조치 문구는 한국어 단일 소스) | "
+                 "저장소에는 커밋하지 않는다. 필요할 때 `python make_figures.py --lang en` 으로 만든다. |")
     lines += ["",
               "샘플 PDF 는 `docs/samples/` 에 있다 (`--only sample_pdf`): `batch_wafer_report_sample.pdf` (합성 로트 3개 x 웨이퍼 2장, "
-              "서비스 리포트 전부 첨부), `lot_report_sample.pdf` (합성 로트 1개의 로트 트러블슈팅 리포트).", "",
-              "규칙: PNG 는 dpi 120~130, 파일당 500KB 이하(넘으면 256색 팔레트로 축소). `--lang en` 은 `_en` 접미사로 영문판을 만든다. "
-              "한글은 동봉 폰트(`docs/fonts/NanumGothic-Regular.ttf`, `_fonts.py`)로 그린다.", ""]
+              "서비스 리포트 전부 첨부, 8쪽), `lot_report_sample.pdf` (합성 로트 1개의 로트 트러블슈팅 리포트, 2쪽).", "",
+              "규칙: PNG 는 dpi 120~130, 파일당 500KB 이하(넘으면 256색 팔레트로 축소). `--lang en` 은 `_en` 접미사로 영문판을 만든다"
+              "(이 README 는 한국어 한 벌만 있다). 한글은 동봉 폰트(`docs/fonts/NanumGothic-Regular.ttf`, `_fonts.py`)로 그린다. "
+              "생성 시각은 2026-01-01 00:00 UTC 로 고정해(`SOURCE_DATE_EPOCH`) 같은 코드면 바이트까지 같다 - "
+              "`tests/test_make_figures.py` 가 두 번 생성해 비교한다.", ""]
     out = img_dir / "README.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -476,46 +573,47 @@ FIGURES: dict[str, str] = {           # 이름 -> 설명 (순서가 실행 순�
     "service_report": "docs/img/service_report_page.png",
     "lot_report": "docs/img/lot_report_page.png",
     "sample_pdf": "docs/samples/*.pdf",
-    "readme": "docs/img/README.md",
+    "readme": "docs/img/README.md (항상 한국어; --lang 무관)",
 }
 
 
 def build(names: list[str], img_dir: Path, samples_dir: Path, lang: str, work: Path, dpi: int = DPI,
           say: Callable[[str], None] = print) -> list[Path]:
-    """지정한 그림을 만들고 생성 경로를 돌려준다. 폰트가 없으면 en 으로 전환한다."""
+    """지정한 그림을 만들고 생성 경로를 돌려준다. 폰트가 없으면 en 으로 전환한다. 생성 시각은 FIXED_TIME."""
     if setup_korean_font() is None and lang == "ko":
         say(TEXT["ko"]["font_none"])
         lang = "en"
     made: list[Path] = []
-    for name in names:
-        if name == "patterns":
-            out = make_patterns(img_dir, lang, dpi)
-        elif name == "spc":
-            out = make_spc(img_dir, lang, work, dpi)
-        elif name == "spc_chamber":
-            out = make_spc_chamber(img_dir, lang, work, dpi)
-        elif name == "pipeline":
-            out = make_pipeline(img_dir, lang, dpi)
-        elif name == "service_report":
-            out = make_service_report(img_dir, lang, dpi)
-        elif name == "lot_report":
-            out = make_lot_report(img_dir, lang, work, dpi)
-        elif name == "sample_pdf":
-            out = make_sample_pdf(samples_dir, lang, work, dpi)
-        elif name == "readme":
-            out = make_readme(img_dir, lang)
-        else:
-            raise ValueError(f"unknown figure {name!r}; choose from {list(FIGURES)}")
-        for p in out:
-            say(f"  {name:15s} {p.relative_to(HERE) if p.is_relative_to(HERE) else p}  ({p.stat().st_size / 1024:.0f} KB)")
-        made.extend(out)
+    with _reproducible():
+        for name in names:
+            if name == "patterns":
+                out = make_patterns(img_dir, lang, dpi)
+            elif name == "spc":
+                out = make_spc(img_dir, lang, work, dpi)
+            elif name == "spc_chamber":
+                out = make_spc_chamber(img_dir, lang, work, dpi)
+            elif name == "pipeline":
+                out = make_pipeline(img_dir, lang, dpi)
+            elif name == "service_report":
+                out = make_service_report(img_dir, lang, dpi)
+            elif name == "lot_report":
+                out = make_lot_report(img_dir, lang, work, dpi)
+            elif name == "sample_pdf":
+                out = make_sample_pdf(samples_dir, lang, work, dpi)
+            elif name == "readme":
+                out = make_readme(img_dir)
+            else:
+                raise ValueError(f"unknown figure {name!r}; choose from {list(FIGURES)}")
+            for p in out:
+                say(f"  {name:15s} {p.relative_to(HERE) if p.is_relative_to(HERE) else p}  ({p.stat().st_size / 1024:.0f} KB)")
+            made.extend(out)
     return made
 
 
 def main(argv: list[str] | None = None) -> list[Path]:
     ap = argparse.ArgumentParser(description="문서용 그림·샘플 PDF 생성 (전부 합성 데이터)")
     ap.add_argument("--only", nargs="+", choices=list(FIGURES), default=None, help="일부 그림만")
-    ap.add_argument("--lang", choices=["ko", "en"], default="ko", help="그림 언어. en 은 파일명에 _en 접미사")
+    ap.add_argument("--lang", choices=["ko", "en"], default="ko", help="그림 언어. en 은 파일명에 _en 접미사 (readme 는 항상 한국어)")
     ap.add_argument("--img-dir", type=Path, default=IMG_DIR)
     ap.add_argument("--samples-dir", type=Path, default=SAMPLES_DIR)
     ap.add_argument("--dpi", type=int, default=DPI, help="PNG dpi (기본 120; wm811k_spc 그림은 자체 130)")

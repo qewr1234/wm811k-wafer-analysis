@@ -6,7 +6,9 @@ Everything verified on synthetic data is a **logic check, not a performance numb
 
 ## 1. Viewpoint
 
-A die-level pass/fail wafer map (effectively a wafer-test bin map) is the accumulated result of every process step. The customer's yield team owns the bin maps, lot history and retest results; the vendor's engineer sees a map only when the customer escalates. What the vendor engineer owns is **tool-side evidence**: alarm/event logs, consumable counters (RF hours, wafer counts), recipe-change history, PM and part-replacement records, robot teaching/centering logs, chamber seasoning history, ESC He pressure and zone temperature logs. So every pattern table separates customer-side from tool-side evidence and ends with a "TEL cause vs hand-off to another vendor's tool" criterion. The single source of all action text is `wafer_pattern_classifier.ACTION_DETAIL`; `tests/test_actions.py` checks that code and documents agree.
+A die-level pass/fail wafer map (effectively a wafer-test bin map) is the accumulated result of every process step. The customer's yield team owns the bin maps, lot history and retest results; the vendor's engineer sees a map only when the customer escalates and must answer "is it our tool, or a hand-off to another vendor's tool?" from tool-side evidence. What the vendor engineer owns is **tool-side evidence**: alarm/event logs, consumable counters (RF hours, wafer counts), recipe-change history, PM and part-replacement records, robot teaching/centering logs, chamber seasoning history, ESC He pressure and zone temperature logs. So every pattern table separates customer-side from tool-side evidence and ends with a "TEL cause vs hand-off to another vendor's tool" criterion. The single source of all action text is `wafer_pattern_classifier.ACTION_DETAIL`; `tests/test_actions.py` checks its structure, the process-physics corrections, current product names and that `defect_signatures.md` has a section for every pattern key (it does not compare sentence by sentence). The action text itself is Korean only; `--lang en` on the reports switches the form, summary and axis labels to English but keeps the Korean action text, and the English action text lives in the table in §5 of this page.
+
+Target position: the **conversion-track internship** "Software Engineer - Tech Support Engineer" in Tokyo Electron Korea's 2026 H2 recruitment (Hwaseong Dongtan; evaluation for conversion after 6 months; checked 2026-10-15, [`references.md`](references.md) [47]). The experienced-hire track of the same recruitment has only Field / Process Engineer positions with hands-on tool requirements, so it is not the target; FE / PE in this repository means the colleagues a technical-support software engineer works with.
 
 TEL product names follow tel.com as of 2026-10: coater/developer CLEAN TRACK LITHIUS Pro series, plasma etch Tactras / Episode UL, gas chemical etch Certas LEAGA, batch furnace TELINDY PLUS, single-wafer deposition Triase+ / Episode / NT333, cleaning CELLESTA / EXPEDIUS / NS300, wafer prober Precio / Prexa, bonder Synapse. TEL does not make CMP, lithography scanners or stand-alone inspection tools, so those items are marked "hand-off". Nothing here assumes TEL internal structures, manuals or PM intervals; unverified items are marked "(estimate)". Sources and their verification level are in [`references.md`](references.md).
 
@@ -44,14 +46,26 @@ Experiment 8 (`wm811k_improve.py`: 8 noise-robust features + HistGradientBoostin
 
 Same as the field procedure in [`defect_signatures.md`](defect_signatures.md). Steps 3–7 are verified on synthetic data only, because WM-811K has no timestamps, chamber, slot or tool history; in the real defect subset most lots have too few wafers (3.2 per lot on average), so the lot-level tools return `insufficient`.
 
-1. **Receive the escalation and classify the map.** Ask for the bin map, lot history (which TEL chamber, when), retest status. Playbook: `python wafer_pattern_classifier.py --actions EDGE_RING`; lot batch report: `python batch_wafer_report.py --anonymize`.
+![Eight synthetic wafer-map patterns (CENTER, DONUT, EDGE_LOC, EDGE_RING, LOC, NEAR_FULL, RANDOM, SCRATCH) in a 2x4 grid; notch at the bottom (assumed).](img/wafer_patterns_synthetic.png)
+
+1. **Receive the escalation and classify the map.** Ask for the bin map, lot history (which TEL chamber, when), retest status. Playbook: `python wafer_pattern_classifier.py --actions EDGE_RING` (Korean output; English version of the same content in §5); lot batch report: `python batch_wafer_report.py --anonymize`.
 2. **Rule out test causes.** NEAR_FULL and grid-periodic patterns can come from the probe card or test program; a retest is the cheapest check (`--actions NEAR_FULL`, field `rule_out_first`). If the prober is Precio / Prexa, the TEL prober check (card cleaning, touchdown counter) goes alongside.
-3. **Does it repeat within the lot?** Whole lot → process condition or tool state; one wafer → handling or particle event: `python wm811k_lot_report.py data/wm811k_defects.pkl --pred test_predictions.csv --lot <lot>` (`--demo`). For batch tools (TELINDY PLUS furnace, EXPEDIUS wet bench) the signature is the pattern rate by boat slot: `python wm811k_slot.py test_predictions.csv --pattern EDGE_RING`.
+3. **Does it repeat within the lot?** Whole lot → process condition or tool state; one wafer → handling or particle event: `python wm811k_lot_report.py data/wm811k_defects.pkl --pred test_predictions.csv --lot <lot>` (`--demo`). For batch tools (TELINDY PLUS furnace, EXPEDIUS wet bench) the signature is the pattern rate as a function of boat slot: `python wm811k_slot.py test_predictions.csv --pattern EDGE_RING`.
 4. **Notch-relative azimuth / scratch shape.** Same angle across the lot → fixed chamber element (exhaust port, gas inlet); scattered → handling: `python wm811k_azimuth.py --demo`. Straight line (transfer system, common to all TEL tools) vs arc (CMP, hand-off; a rule of thumb, not a law): `python wm811k_scratch_shape.py --demo`. Notch direction is an assumption (`--notch-deg`).
 5. **Match tool-side evidence.** Alarm/event logs, consumable counters (edge-ring RF hours, wafers since seasoning), recipe/PM history, robot teaching logs, ESC He pressure and zone temperatures, pulled for the lot's processing time: `ACTION_DETAIL[pattern]["tool_evidence"]`.
 6. **Tool commonality.** Which tools/chambers the bad lots shared: `python wm811k_commonality.py test_predictions.csv --history lot_history.csv --pattern EDGE_LOC` (`--demo`; input schema in [`lot_history_schema.md`](lot_history_schema.md)).
 7. **Since when?** Pattern-rate control chart with PM / part-replacement events overlaid: `python wm811k_spc.py test_predictions.csv --time-col <t> --event-col <event> --group-col chamber` (`--demo`). If the onset coincides with an event, that is the answer.
 8. **TEL cause or hand-off, then report.** Decide with `ACTION_DETAIL[pattern]["handoff"]`, then initial → interim → closing reports ([`handoff.md`](handoff.md)). A fully worked synthetic example in 8D form: [`case_study_8d.md`](case_study_8d.md).
+
+Step 7, the stratified control chart of the synthetic demo (chamber B only carries the planted EDGE_RING drift, low-confidence rise and SCRATCH step; PM / part-replacement events are the vertical dashed lines). The committed figures carry Korean labels; `python make_figures.py --lang en` writes English versions with an `_en` suffix.
+
+![Per-chamber incidence control charts; EDGE_RING in chamber B rises after wafer 3000, with pm_wet_clean and focus_ring_replaced events overlaid as vertical dashed lines.](img/spc_demo_chamber.png)
+
+Step 8, the two report forms (synthetic data; Tool / Chamber fields left blank):
+
+| Service report page (`batch_wafer_report.py`) | Lot troubleshooting report page (`wm811k_lot_report.py --demo`) |
+|---|---|
+| ![Service-report form: lot summary, pattern verdict, severity, check order, tool-side evidence, data to collect, checklist](img/service_report_page.png) | ![Lot report: pattern mix, within-lot repetition, azimuth, scratch shape, slot, suspect-module ranking, OCAP level](img/lot_report_page.png) |
 
 ## 5. Pattern → suspected module → checks (summary of `defect_signatures.md`)
 
@@ -68,18 +82,18 @@ Default severity: NEAR_FULL = line-stop review (`line_stop_review`), RANDOM = mo
 | RANDOM (no spatial structure) | Baseline defect density of the line: particles, gate-oxide defects, random litho defects. The Poisson yield model presupposes this regime; real fab data cluster, which is already LOC / EDGE_LOC. Cleaning-tool changes (batch ↔ single-wafer) shift the baseline density; Certas LEAGA is liquid-free (no watermarks) | Etch / deposition / furnace chambers: seasoning and particles right after PM. CELLESTA / EXPEDIUS / NS300: baseline defect density. CLEAN TRACK LITHIUS Pro: too-narrow EBR → flakes | Stand-alone inline particle inspection (primary data); line cleanliness (customer facility) | (1) put fail_frac itself on the `FAIL_FRAC_MEAN` chart: gradual rise → line contamination, single lot → that lot's history; (2) clustering → it is LOC / EDGE_LOC (isolated_frac, hypothesis); (3) inline particle trend per step; (4) TEL chamber: post-PM particles, wafers since seasoning; (5) before/after a cleaning-tool change | Wrong design assumption (n_comp AUC 0.155); F1 0.90 |
 | NEAR_FULL (most of the wafer failing) | Process incident or test cause. **Rule out the test side first**: probe-card planarity, overdrive, contact resistance (CRES), test-program limits, product/wafer-ID mix-up all print as full failure; tip contamination raising CRES recovers after cleaning sheets / scrub. Then abnormal termination in the lot history (recipe error, skipped step, tool down). Broken wafers usually never reach test (estimate) | Precio / Prexa: probe-card contact, cleaning, touchdown counter. All TEL process tools: alarm/event logs, recipe abort records | Test program / tester; other vendors' process tools that aborted | (1) **retest** (planarity, overdrive, CRES, limits, ID); (2) other wafers of the same lot (process incident) or one wafer (single event); (3) lot history abnormal termination vs tool alarm logs; (4) if confirmed, line-stop / lot-hold decision together with the customer yield team (initial report); (5) handling alarm logs if breakage is suspected | fail_frac AUC 1.000; F1 0.98; 149 wafers. Operations prioritize **recall**: a miss delays the line-stop decision, a false alarm costs one retest |
 
-The cost of misclassification is discussed per confusion pair in [`defect_signatures.md`](defect_signatures.md) ("오분류의 현장 비용"): e.g. LOC read as EDGE_LOC sends the engineer to robot centering instead of particle sources and lift pins; SCRATCH read as LOC skips the transfer-system check; a missed NEAR_FULL is the most expensive error, so a `fail_frac` hard rule precedes the classifier and low-confidence wafers are reviewed by a person.
+The cost of misclassification is discussed per confusion pair in [`defect_signatures.md`](defect_signatures.md) (section "Field cost of misclassification", Korean): e.g. LOC read as EDGE_LOC sends the engineer to robot centering instead of particle sources and lift pins; SCRATCH read as LOC skips the transfer-system check; a missed NEAR_FULL is the most expensive error, so a `fail_frac` hard rule precedes the classifier and low-confidence wafers are reviewed by a person.
 
 ## 6. SPC on top of the classifier (`wm811k_spc.py`)
 
 The classifier judges one wafer; this script is the stage above it. Predictions are grouped into subgroups in time order and the question is "is the rate of this pattern rising?" — the one-directional drift (consumable wear, chamber contamination build-up) that single-wafer judgment cannot see. In industry terms: per-pattern p-charts are a fault-detection indicator built from result data instead of tool sensors; Phase I/II = limit setting / monitoring; EWMA = run-to-run drift monitoring; the low-confidence chart = model-drift monitoring. Tool-side FDC/APC software (for TEL, Ingenio is the APC/FDC trademark and TELeMetrics the remote monitoring service, per 2015 press) handles sensor data; this script handles result data, and `--time-col` / `--event-col` put the two on one time axis. TEL internals are unknown. Details and all demo numbers: [`spc.md`](spc.md).
 
 - **Per-pattern p-charts** with limits recomputed per subgroup size; rare patterns get subgroups enlarged automatically so that n·p̄ ≥ 5 and n·(1−p̄) ≥ 5. The x-axis is the wafer index, so charts with different subgroup sizes share one axis.
-- **Occurrence vs share.** If the prediction CSV contains CLEAN/none the denominator is all inspected wafers (occurrence-rate chart); otherwise it is defect wafers only (share chart), whose rates sum to 1 so a rising pattern mechanically pushes others down. The mode is detected automatically and downward alarms are excluded from the check list by default (`--up-only`).
+- **Occurrence vs share.** If the prediction CSV contains CLEAN/none the denominator is all inspected wafers (incidence chart); otherwise it is defect wafers only (share chart), whose rates sum to 1 so a rising pattern mechanically pushes others down. The mode is detected automatically and downward alarms are excluded from the check list by default (`--up-only`).
 - **Laney p′** overdispersion correction: wafers of one lot share patterns, so between-lot variation exceeds binomial variance and plain p-charts keep false-alarming. σz = mean moving range of baseline z-scores / 1.128; limits are widened by σz. Skipped when the baseline has fewer than 20 subgroups; σz < 1 is clamped to 1 (a deliberate conservative deviation from Laney's original).
-- **Rules**: Western Electric R1–R4 and EWMA (λ 0.2, L 2.86 — the ARL0 ≈ 500 pair per Lucas & Saccucci 1990 tables, not re-verified from the original). Limits come from the first 50% (baseline); a baseline alarm rate above 5% triggers a warning that the data are not in time order or not stable.
+- **Rules**: Western Electric R1–R4 and EWMA (λ 0.2, L 2.86 — in-control ARL0 ≈ 370, computed here with a Markov-chain approximation, the same level as the 3σ rule R1; the ARL0 ≈ 500 pair at λ 0.2 would be L 2.962). Limits come from the first 50% (baseline); a baseline alarm rate above 5% triggers a warning that the data are not in time order or not stable.
 - **Low-confidence chart**: fraction of wafers below a confidence threshold taken as a baseline quantile (`--conf-quantile`, default 0.10) rather than a fixed value, because the probability distribution depends on model and class count. `confidence` = RF `predict_proba` maximum from `wm811k_validate.py --export-predictions` (uncalibrated); the rule classifier's `score` is accepted as an alias with a warning.
-- **Field options**: `--group-col chamber|tool|slot` (stratified charts `EDGE_RING@B` plus chi-square between groups), `--event-col` (PM / part-replacement vertical lines and distance from first detection to the nearest earlier event), `--anonymize` (lot and group IDs replaced by keyed hashes, no mapping saved), `--lang en`. Outputs: chart PNG, subgroup CSV, alarm CSV with field columns (`acknowledged_at`, `action`, `verified_at`), and a human-readable alarm report `spc_<stem>_report.md`.
+- **Field options**: `--group-col chamber|tool|slot` (stratified charts `EDGE_RING@B` plus chi-square between groups), `--event-col` (PM / part-replacement vertical lines and distance from first detection to the nearest earlier event), `--anonymize` (lot and group IDs replaced by 16-hex keyed hashes, no mapping saved; the key comes from `WM811K_ANON_KEY` or `--anon-key-env VAR` so the reports of one issue share IDs, otherwise a fresh key per run), `--lang en` (English headings, axis labels and summary lines; the per-pattern check items and tool-side log lists stay Korean, single source). Outputs: chart PNG, subgroup CSV, alarm CSV with field columns (`acknowledged_at`, `action`, `verified_at`), and a human-readable alarm report `spc_<stem>_report.md`.
 - **Demo** (synthetic, logic only): 6,000 wafers / 240 lots / chambers A–B; EDGE_RING drift planted in chamber B from wafer 3000 (first detected by R3 at 3799 overall, by R4 at 3574 stratified), low confidence from 3750 (R3 at 3849), a SCRATCH step from 4125 (R1/EWMA at 4499). Baseline false-alarm rate 0 %, 3 rising false alarms among 131 monitored points in the stratified run.
 - **Not usable on WM-811K itself**: its row order is product/lot block order, not time; the script detects this and warns.
 
@@ -100,7 +114,7 @@ The classifier judges one wafer; this script is the stage above it. Predictions 
 | `wm811k_slot.py` | Slot (waferIndex proxy) dependence: end-slot 2×2, lot-stratified permutation test, Spearman trend |
 | `wm811k_commonality.py` | Tool commonality from a lot-history CSV: within-step Fisher test, BH correction, routing overlap warning |
 | `wm811k_lot_report.py` | Lot troubleshooting report PDF + JSON: mix, repetition, azimuth, shape, slot, commonality, suspect ranking, OCAP level, 8D-D2 draft |
-| `batch_wafer_report.py` | Batch PDF + one-page service-report form per lot. `--lang en`, `--anonymize`, `--service-report` |
+| `batch_wafer_report.py` | Batch PDF + one-page service-report form per lot. `--lang en` (form and headings only; action text stays Korean), `--anonymize`, `--service-report` |
 | `plotly_wafer_heatmap.py` | Parametric (thickness / CD) wafer map as self-contained offline HTML. `--csv` (die_x, die_y, value) |
 | `prepare_wm811k.py` | Extract labeled wafers from LSWMD.pkl. `--sample N` (by lot) |
 | `make_figures.py` | Regenerates every figure and sample PDF in `docs/img` and `docs/samples` from synthetic data. `--only`, `--lang en` |
@@ -111,7 +125,7 @@ The classifier judges one wafer; this script is the stage above it. Predictions 
 | `docs/process_context.md` | Signatures by process step, six tool subsystems, safety / cleanroom checklist before touching a tool |
 | `docs/handoff.md` | TEL cause vs hand-off criteria, three-stage customer reporting, 8D team roles, customer-data confidentiality |
 | `docs/case_study_8d.md` | Two synthetic 8D cases (EDGE_RING drift, SCRATCH step): timeline, 5-why, report examples, recovery after action |
-| `docs/spc.md` | SPC details: occurrence vs share, automatic subgroups, Laney, EWMA parameters, demo detection times, column dictionary |
+| `docs/spc.md` | SPC details: incidence vs share, automatic subgroups, Laney, EWMA parameters, demo detection times, column dictionary |
 | `docs/validation_log.md` | Experiments 0–8 (hypothesis → script → numbers → conclusion), design principles, number-freeze rule |
 | `docs/roadmap.md` | Verification scope per feature (real / synthetic / unmeasured) and remaining items |
 | `docs/glossary.md` | Equipment, defect, quality and statistics terms in Korean / English / Japanese |
@@ -123,17 +137,20 @@ The classifier judges one wafer; this script is the stage above it. Predictions 
 
 ## 8. Running
 
-Python ≥ 3.10 (CI uses 3.11 / 3.12). On Windows every script switches the console and file redirection to UTF-8 itself; the Korean font is bundled in `docs/fonts/`. Data path via `WM811K_DIR`; outputs are written next to the scripts and ignored by git.
+Python 3.11 / 3.12 (the versions CI verifies; 3.10 and below are untested). On Windows every script switches the console and file redirection to UTF-8 itself; the Korean font is bundled in `docs/fonts/`. Data path via `WM811K_DIR`; outputs are written next to the scripts and ignored by git.
 
 ```bash
 pip install -r requirements-dev.txt
-# (1) Five minutes without data - all synthetic (logic checks, not performance)
+# (1) About five minutes without data (4 cores) - all synthetic (logic checks, not performance)
 python wafer_pattern_classifier.py                                   # synthetic self-check 7/7, exit code 1 on failure
-python -m pytest -q                                                  # whole tests/ (about 2 minutes)
+python -m pytest -q                                                  # whole tests/, 174 tests (2-3 minutes on 4 cores; longest: test_pipeline_end_to_end, about 1 minute)
 python batch_wafer_report.py --lang en --anonymize                   # batch PDF + service-report form
 python wm811k_spc.py --demo --group-col chamber --event-col event --lang en   # charts, alarm CSV, alarm report (spc/)
 python wm811k_lot_report.py --demo --lang en                         # lot troubleshooting report PDF + JSON
-python wm811k_azimuth.py --demo && python wm811k_scratch_shape.py --demo && python wm811k_slot.py --demo && python wm811k_commonality.py --demo
+python wm811k_azimuth.py --demo                                      # within-lot azimuth (one per line: Windows PowerShell 5.x has no &&)
+python wm811k_scratch_shape.py --demo                                # scratch line vs arc
+python wm811k_slot.py --demo                                         # slot dependence
+python wm811k_commonality.py --demo                                  # tool / chamber commonality
 python make_figures.py --lang en                                     # regenerate docs/img, docs/samples (English labels, _en suffix)
 # (2) Real data - needs data/LSWMD.pkl (about 2 GB, see data/README.md). Times are 4-core estimates
 python prepare_wm811k.py                                             # -> data/wm811k_defects.pkl (minutes)
@@ -152,7 +169,7 @@ python wm811k_improve.py                                             # 8 robust 
 - The defect subset averages 3.2 wafers per lot (25,519 / 8,047), so most lot-level tests return `insufficient`.
 - Row order is not time order, so SPC cannot be applied to WM-811K itself.
 - Classifier: remaining confusions LOC → EDGE_LOC (542) and SCRATCH → LOC (270); the 147,431 `none` wafers are excluded, so the "is there a pattern at all?" gate is unmeasured; train/test gap 0.99 / 0.91; `wm811k_improve.py` unmeasured; map sizes (329) have unknown physical dimensions, so all radii are ratios; no CNN / image-based model was tried.
-- Equipment statements are public-source level (product pages, patents, papers, textbook process physics). TEL internal structures, manuals and PM intervals are unknown; "(estimate)" marks unverified items; community-sourced claims are not used.
+- Equipment descriptions stay at the level of public sources (product pages, patents, papers, textbook process physics). TEL internal structures, manuals and PM intervals are unknown; "(estimate)" marks unverified items; community-sourced claims are not used.
 
 ## 10. Sources and license
 

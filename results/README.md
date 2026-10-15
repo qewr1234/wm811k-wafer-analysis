@@ -1,5 +1,9 @@
 # results/ — 실측 수치의 재현 근거
 
+> **현재 상태: 산출물 미첨부.** 이 폴더에 커밋된 것은 이 README 와 `environment.txt`(값이 전부 '(미기록)'인 틀)뿐이다.
+> 아래 표의 파일은 소유자가 LSWMD.pkl 이 있는 PC 에서 실행해 채운다. 그 전까지 README 의 실측 수치는
+> 저장소 안에서 검증되지 않는다(합성 데이터·CI 로는 재측정할 수 없다).
+
 README 의 실측 수치(규칙 미교정 0.167 → 교정 0.558 → 구조 특징 RF 0.878 ± 0.008 → 위치 특징 RF **0.907 ± 0.008**)는
 WM-811K 원본(LSWMD.pkl, 약 2GB)으로 낸 것이라 CI 에서는 재측정하지 않는다. 이 폴더는 그 숫자를 낸
 **실행의 산출물 원본**을 두는 곳이다. 저장소의 `.gitignore` 는 `*.csv` 를 제외하지만 `results/*.csv`,
@@ -13,7 +17,7 @@ WM-811K 원본(LSWMD.pkl, 약 2GB)으로 낸 것이라 CI 에서는 재측정하
 | `wm811k_improve_results.csv` | `python wm811k_improve.py` | 같은 5분할의 RF-20 / RF-28 / HGB-20 / HGB-28 (README '다음 실험' 절을 측정값으로 바꿀 때) |
 | `calibrated_thresholds.txt` | `python wm811k_calibrate.py > results/calibrate.log` 의 '교정된 임계값' 블록을 그대로 복사 | 13개 임계값의 교정 전/후 (README 2번 항목 `center_r` 0.30 → 0.74 등의 원본) |
 | `confusion_rf20.txt` | `wm811k_validate.py` 콘솔 출력의 'RF-20개 confusion matrix (5회 합산)' 블록 | README 의 EDGE_LOC↔LOC 오분류 장수의 원본 |
-| `evaluate.log`, `calibrate.log`, `structural.log`, `validate.log`, `improve.log` | 각 스크립트를 `> results/<이름>.log` 로 리다이렉트 (Windows 도 동작, cp949 회귀는 CI 가 검사) | 콘솔 로그 전체. 각 단계의 train/test 숫자·AUC 표·클래스별 F1 |
+| `evaluate.log`, `calibrate.log`, `structural.log`, `validate.log`, `improve.log` | 각 스크립트를 `> results/<이름>.log` 로 리다이렉트 (Windows 도 동작, cp949 회귀는 CI 가 검사) | 콘솔 로그 전체. 각 단계의 train/test 숫자·AUC 표·클래스별 F1. 특징 테이블 저장 줄의 `라벨 N장 중 제외 n장` 이 실제 학습에 쓰인 장수의 근거다 |
 | `environment.txt` | 아래 '환경 기록' | 숫자를 낸 PC 의 Python·패키지 버전 |
 
 로그 파일은 `.txt` 로 저장해야 커밋된다(`.log` 는 제외 패턴에 걸리지 않지만 예외 목록에도 없다). 예: `> results/validate.txt`.

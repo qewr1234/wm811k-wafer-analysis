@@ -15,7 +15,7 @@
 #     EWMA             = run-to-run 드리프트 감시. R2R 제어기가 보정하는 느린 이동을 결과 쪽에서 확인
 #     저신뢰 관리도    = 모델 드리프트(model drift) 감시. 분류기가 낡았는지 보는 관리도
 #   장비 쪽 FDC/APC 소프트웨어(TEL 의 경우 Ingenio 가 APC/FDC 상표, TELeMetrics 가 원격 모니터링
-#   서비스 - 2015년 기사 기준)가 센서 데이터를 다루고, 이 스크립트는 결과 데이터를 다룬다.
+#   서비스 - 2016년 보도 기준, 2015년 출시)가 센서 데이터를 다루고, 이 스크립트는 결과 데이터를 다룬다.
 #   --time-col / --event-col 로 둘을 같은 시간축에 놓는 것이 결합 지점이다. 내부 구현은 모른다.
 #
 #   SEMI E10 관점: 장비 상태는 예정 정지(scheduled downtime, PM)와 비예정 정지(unscheduled
@@ -46,16 +46,20 @@
 #               세정 베이스라인 결함 밀도처럼 '패턴 없는 전체 수준'을 감시하는 용도.
 #   [--group-col] chamber/tool/slot 같은 열로 층화해 'EDGE_RING@B' 식으로 따로 그리고,
 #               그룹 간 발생률 차이의 카이제곱 p 값을 낸다. 한 챔버의 드리프트는 전체
-#               관리도에서는 희석되므로 층화가 먼저다(현장 순서 4번 '공통성 분석').
+#               관리도에서는 희석되므로 층화가 먼저다(현장 순서 6번 '공통성 분석').
 #   [--event-col] 부품 교체·PM 같은 이벤트가 적힌 열을 그림에 세로 점선으로 표시하고,
 #               상승 알람의 첫 탐지 시점과 가장 가까운 이전 이벤트의 거리(웨이퍼 수)를 낸다
-#               (현장 순서 5번 '언제부터인가').
-#   [--anonymize] 로트명·그룹 ID 를 짧은 해시로 치환한다. 매핑 표는 저장하지 않는다.
+#               (현장 순서 7번 '언제부터인가').
+#   [--anonymize] 로트명·그룹 ID 를 키드 해시(blake2b 8바이트 = 16 hex)로 치환한다. 매핑 표는 저장하지
+#               않는다. 키는 환경변수 WM811K_ANON_KEY(또는 --anon-key-env 로 지정한 변수)에서 읽고,
+#               없으면 실행마다 새로 뽑는다. 초동·중간·종결 보고나 로트 리포트처럼 여러 실행의 산출물을
+#               서로 대조하려면 같은 키를 써야 한다. 키는 저장소·보고서에 넣지 않는다.
 #               고객 팹 데이터를 보고서에 담을 때 기밀 취급용.
 #   [보고서]    spc_<stem>_report.md 에 데이터 범위, 관리도 종류, baseline 알람률, 패턴별
-#               중심선->최근값, 첫 탐지 규칙·시점, 이벤트 거리, 점검 항목, 대조할 장비 측
-#               로그를 적는다. alarms.csv 에는 현장 기록용 빈 열(acknowledged_at, action,
-#               verified_at)을 둔다.
+#               중심선->최근값, 첫 탐지 규칙·시점, 감시 알람 점 수(규칙·연속 여부), 이벤트 거리,
+#               점검 항목, 대조할 장비 측 로그를 적는다. R1 1점뿐인 단발 알람에는 점검 목록 대신
+#               '다음 부분군 확인 후 조치' 한 줄만 쓴다(1점 허위 알람과 추세를 구분하기 위해).
+#               alarms.csv 에는 현장 기록용 빈 열(acknowledged_at, action, verified_at)을 둔다.
 #
 # 규칙 (Western Electric)
 #   R1  3σ 밖 1점            R2  연속 3점 중 2점이 같은 쪽 2σ 밖
@@ -83,6 +87,9 @@
 #   python wm811k_spc.py --demo --group-col chamber --event-col event
 #   python wm811k_spc.py test_predictions.csv --time-col process_end_time --group-col chamber \
 #                        --event-col pm_event --anonymize --lang en
+#   WM811K_ANON_KEY=... python wm811k_spc.py test_predictions.csv --anonymize     # 여러 실행에서 같은 익명 ID
+#
+# 구조: 1 입력 정리 -> 2 관리도 계산 -> 3 보고(표·그림·md) -> 4 데모 -> 5 실행(main 은 단계 함수를 잇기만 한다)
 
 from __future__ import annotations
 
@@ -90,7 +97,7 @@ import argparse
 import hashlib
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib
@@ -100,11 +107,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import chi2_contingency
 
-try:
-    from _fonts import setup_korean_font
-except ImportError:
-    from batch_wafer_report import setup_korean_font
-import wafer_pattern_classifier as _wpc
+from _fonts import setup_korean_font
+from wafer_pattern_classifier import ACTION_DETAIL, ACTIONS   # 조치 플레이북의 단일 소스 (first_checks, tool_evidence ...)
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -114,13 +118,17 @@ HERE = Path(__file__).resolve().parent
 CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
            "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
 CLEAN_LABELS = {"CLEAN", "none", "NONE", "None"}
-ACTIONS: dict[str, str] = _wpc.ACTIONS
-# ACTION_DETAIL 은 다른 작업에서 추가되는 상세 점검 사전(first_checks, tool_evidence ...). 없으면 ACTIONS 만 쓴다.
-ACTION_DETAIL: dict = getattr(_wpc, "ACTION_DETAIL", {})
+
+# 익명화: blake2b 키드 해시. 8바이트(16 hex)다. 4바이트(8 hex)면 생일 충돌 확률이 8,047로트 0.8%,
+# WM-811K 전체 로트 수 46,293 에서 22% 라 서로 다른 로트가 한 ID 로 합쳐질 수 있다(8바이트면 1e-10 수준).
+# 그래도 anonymize_ids 는 충돌을 검사해 멈춘다. 키는 환경변수 ANON_KEY_ENV 에서 읽는다(여러 실행의 산출물 대조용).
+ANON_DIGEST_SIZE = 8
+ANON_KEY_ENV = "WM811K_ANON_KEY"
 
 EWMA_LAMBDA = 0.2
-# lambda=0.2 에서 ARL0 ~ 500 이 되는 L (Lucas & Saccucci 1990 표 기준: (0.05, 2.615) (0.10, 2.70)
-# (0.20, 2.86) (0.25, 2.998)). 이전 값 2.7 은 lambda=0.1 짝이라 ARL0 가 500 보다 짧았다.
+# lambda=0.2, L=2.86 -> 관리 상태 ARL0 ~ 370 (마르코프 체인 자체 계산 371; 3 sigma 규칙 R1 과 같은 수준).
+# ARL0 ~ 500 짝은 (0.05, 2.615) (0.10, 2.814) (0.20, 2.962) (0.25, 2.998) (Lucas & Saccucci 1990 표 값을
+# 같은 계산으로 재현). 이전 값 2.7 은 ARL0 ~ 240 으로 허위 알람이 잦았다. 값 변경 시 docs/spc.md 9절 재측정.
 EWMA_L = 2.86
 MIN_EXPECTED = 5.0        # 정규 근사 조건 n*p_bar >= 5 와 n*(1-p_bar) >= 5
 LANEY_MIN_BASE = 20       # 이보다 baseline 부분군이 적으면 Laney 보정 생략 (이동 범위 추정이 불안정)
@@ -165,6 +173,9 @@ LABELS: dict[str, dict[str, str]] = {
         "r_lowconf_text": "LOW_CONFIDENCE 상승: 분류기가 헷갈리는 웨이퍼가 늘었다. 새 패턴 출현 또는 분류기 노후 신호이므로 "
                           "저신뢰 웨이퍼를 직접 검토하고, 그 전까지 다른 패턴 관리도의 해석을 보류한다.",
         "r_group": "그룹 간 비교",
+        "r_points": "감시 알람 점 수 (규칙; 연속)", "single": "단발", "run": "연속 {k}점",
+        "r_single": "단발 알람(R1 1점) - 점검 목록 대신 다음 부분군을 확인한 뒤 조치. 재발하면 추세로 본다.",
+        "r_no_events": "이벤트 없음 (--event-col 열이 전부 비어 있다)",
     },
     "en": {
         "xlabel": "wafer sequence (time order)", "baseline": "baseline (limit-setting window)",
@@ -194,6 +205,9 @@ LABELS: dict[str, dict[str, str]] = {
         "r_lowconf_text": "LOW_CONFIDENCE rising: the classifier is unsure about more wafers. This signals a new pattern or a stale model; "
                           "review the low-confidence wafers directly and hold interpretation of the other charts until then.",
         "r_group": "Between-group comparison",
+        "r_points": "Monitor alarm points (rules; run)", "single": "single", "run": "run of {k}",
+        "r_single": "Single-point alarm (one R1) - confirm with the next subgroup before acting; no checklist. Treat a repeat as a trend.",
+        "r_no_events": "No events (the --event-col column is entirely empty)",
     },
 }
 
@@ -231,16 +245,42 @@ def chart_mode(df: pd.DataFrame) -> str:
     return "incidence" if df["y_pred"].isin(CLEAN_LABELS).any() else "share"
 
 
+def anon_key_from_env(name: str = ANON_KEY_ENV) -> bytes | None:
+    """환경변수 name 의 값을 해시 키(32바이트)로. 변수가 없거나 비어 있으면 None.
+    값을 그대로 쓰지 않고 sha256 으로 접는 이유: blake2b 키는 64바이트 이하여야 하고, 길이에 상관없이 같은 취급을 하기 위해."""
+    v = os.environ.get(name, "")
+    return hashlib.sha256(v.encode("utf-8")).digest() if v else None
+
+
+def resolve_anon_key(env_name: str | None) -> tuple[bytes | None, str]:
+    """--anon-key-env 처리. (키 또는 None, 콘솔용 근거 문자열).
+    env_name 을 명시했는데 변수가 비어 있으면 멈춘다(조용히 무작위 키로 떨어지면 산출물 대조가 깨진 줄 모른다).
+    명시하지 않으면 기본 변수 ANON_KEY_ENV 가 있을 때만 쓰고, 없으면 실행마다 새 키."""
+    name = env_name or ANON_KEY_ENV
+    key = anon_key_from_env(name)
+    if key is None and env_name:
+        sys.exit(f"--anon-key-env {env_name}: 환경변수가 없거나 비어 있다. 같은 사안의 보고는 같은 키로 익명화해야 "
+                 f"산출물 간 로트·그룹 ID 가 맞는다.")
+    return key, (f"환경변수 {name}, 여러 실행에서 같은 ID" if key else f"실행마다 새 키 (환경변수 {name} 없음; 이 실행 안에서만 일관)")
+
+
 def anonymize_ids(df: pd.DataFrame, cols: list[str], salt: bytes | None = None) -> pd.DataFrame:
-    """지정 열의 값을 짧은 키드 해시(8 hex)로 치환한다. salt 가 없으면 실행마다 새로 뽑고, 매핑 표는 저장하지 않는다."""
-    salt = os.urandom(8) if salt is None else salt
+    """지정 열의 값을 키드 해시(ANON_DIGEST_SIZE 바이트 = 16 hex)로 치환한다. 매핑 표는 저장하지 않는다.
+
+    salt 가 없으면 실행마다 새로 뽑는다(실행 사이에 같은 ID 가 필요하면 resolve_anon_key 로 환경변수 키를 넘긴다).
+    같은 열 안에서 서로 다른 값이 같은 해시가 되면(충돌) 두 로트가 한 로트로 집계되므로 ValueError 로 멈춘다.
+    """
+    salt = os.urandom(16) if salt is None else salt
     out = df.copy()
     for c in cols:
         if c not in out.columns:
             continue
         vals = out[c].astype(str)
-        table = {v: hashlib.blake2b(v.encode("utf-8"), key=salt, digest_size=4).hexdigest()
+        table = {v: hashlib.blake2b(v.encode("utf-8"), key=salt, digest_size=ANON_DIGEST_SIZE).hexdigest()
                  for v in pd.unique(vals)}
+        if len(set(table.values())) != len(table):
+            raise ValueError(f"{c}: 익명화 해시 충돌 ({len(table)}개 값, {ANON_DIGEST_SIZE}바이트) - "
+                             f"키(salt)를 바꾸거나 ANON_DIGEST_SIZE 를 늘려라")
         out[c] = vals.map(table)
     return out
 
@@ -650,48 +690,86 @@ def plot_charts(charts: list[Chart], n_base_rows: int, out_png: Path, title: str
 
 
 def _detail_list(pattern: str, key: str) -> list[str]:
-    d = ACTION_DETAIL.get(pattern)
-    if not isinstance(d, dict) or key not in d:
-        return []
-    v = d[key]
-    if isinstance(v, str):
-        return [v]
-    try:
-        return [str(x) for x in v]
-    except TypeError:
-        return [str(v)]
+    """ACTION_DETAIL[pattern][key] 를 문자열 목록으로 (항목이 없으면 빈 목록; 한 줄 문자열 필드는 1원소 목록)."""
+    v = ACTION_DETAIL.get(pattern, {}).get(key, [])
+    return [v] if isinstance(v, str) else [str(x) for x in v]
 
 
 def checks_for(pattern: str) -> list[str]:
-    """점검 항목: ACTION_DETAIL 의 first_checks 가 있으면 그것, 없으면 ACTIONS 한 줄."""
-    fc = _detail_list(pattern, "first_checks")
-    if fc:
-        return fc
-    return [ACTIONS[pattern]] if pattern in ACTIONS else []
+    """점검 항목: ACTION_DETAIL 의 first_checks, 없으면 ACTIONS 한 줄 요약."""
+    return _detail_list(pattern, "first_checks") or ([ACTIONS[pattern]] if pattern in ACTIONS else [])
 
 
-def write_report(path: Path, ctx: dict) -> None:
-    """spc_<stem>_report.md - 사람이 읽는 알람 요약. ctx 는 main 이 모은 값들."""
-    L = LABELS[ctx["lang"]]
-    charts: list[Chart] = ctx["charts"]
-    by_name = {ch.name: ch for ch in charts}
-    fd = first_detection(ctx["alarms"], up_only=True)
-    ev = ctx["event_dist"]
+def alarm_profile(name: str, alarms: pd.DataFrame) -> dict:
+    """감시 구간 상승 알람의 모양: 알람 부분군 수, 울린 규칙, 마지막 알람에서 거슬러 센 연속 부분군 수.
+
+    single = 알람 부분군이 하나뿐이고 규칙이 R1 뿐. 연속 규칙(R2-R4)·EWMA 는 정의상 여러 점이 쌓여야 울리므로
+    한 부분군에만 표시돼도 단발이 아니다. 단발은 1점 허위 알람일 수 있어 점검 목록 대신 다음 부분군 확인을 권한다.
+    """
+    m = alarms[(alarms["chart"] == name) & (alarms["phase"] == "monitor") & (alarms["direction"] == "up")]
+    subs = sorted(set(m["subgroup"].astype(int)))
+    rules = sorted(set(m["rule"]))
+    run, expect = 0, (subs[-1] if subs else None)
+    for s in reversed(subs):
+        if s != expect:
+            break
+        run, expect = run + 1, s - 1
+    return {"points": len(subs), "rules": rules, "run": run, "single": len(subs) == 1 and rules == ["R1"]}
+
+
+def profile_text(p: dict, lang: str) -> str:
+    """alarm_profile -> '13 (EWMA,R1,R2,R3,R4); 연속 9' / '1 (R1); 단발'."""
+    L = LABELS[lang]
+    tag = L["single"] if p["single"] else (L["run"].format(k=p["run"]) if p["run"] >= 2 else "")
+    return f"{p['points']} ({','.join(p['rules'])})" + (f"; {tag}" if tag else "")
+
+
+@dataclass
+class RunContext:
+    """write_report 입력. main 의 단계 함수들이 채운다."""
+    lang: str
+    stem: str
+    source: str
+    synthetic: bool
+    mode: str                              # "incidence" | "share"
+    range_text: str
+    settings_text: str
+    base_rate_text: str
+    charts: list[Chart]
+    alarms: pd.DataFrame                   # up_only 면 감시 구간 하강 알람은 뺀 표
+    n_down: int = 0                        # 점검에서 제외한 하강 알람 수 (up_only 일 때)
+    event_dist: pd.DataFrame | None = None
+    n_events: int | None = None            # --event-col 을 줬을 때 이벤트 수 (0 = 열이 전부 비어 있음), 안 줬으면 None
+    group_table: pd.DataFrame | None = None
+    dropped: dict[str, str] = field(default_factory=dict)
+    png_name: str = ""
+
+
+def write_report(path: Path, ctx: RunContext) -> None:
+    """spc_<stem>_report.md - 사람이 읽는 알람 요약."""
+    L = LABELS[ctx.lang]
+    by_name = {ch.name: ch for ch in ctx.charts}
+    fd = first_detection(ctx.alarms, up_only=True)
+    ev = ctx.event_dist
     ev_by = {} if ev is None or ev.empty else ev.set_index("chart").to_dict("index")
-    out = [f"# {L['r_title']} - {ctx['stem']}", ""]
-    if ctx["synthetic"]:
+    out = [f"# {L['r_title']} - {ctx.stem}", ""]
+    if ctx.synthetic:
         out += [f"> {L['r_synthetic']}", ""]
-    out += [f"- {L['r_input']}: {ctx['source']}",
-            f"- {L['r_range']}: {ctx['range_text']}",
-            f"- {L['r_kind']}: {L[ctx['mode']]}",
-            f"- {L['r_settings']}: {ctx['settings_text']}",
-            f"- {L['r_baseline']}: {ctx['base_rate_text']}", ""]
+    out += [f"- {L['r_input']}: {ctx.source}",
+            f"- {L['r_range']}: {ctx.range_text}",
+            f"- {L['r_kind']}: {L[ctx.mode]}",
+            f"- {L['r_settings']}: {ctx.settings_text}",
+            f"- {L['r_baseline']}: {ctx.base_rate_text}", ""]
+    if ctx.n_events == 0:
+        out += [L["r_no_events"], ""]
     up_charts = sorted(set(fd["chart"])) if not fd.empty else []
+    profiles = {name: alarm_profile(name, ctx.alarms) for name in up_charts}
     out += [f"## {L['r_up']}", ""]
     if not up_charts:
         out.append(L["r_none_up"])
     else:
-        out += [f"| {L['r_chart']} | {L['r_center']} | {L['r_first']} | {L['r_evdist']} |", "|---|---|---|---|"]
+        out += [f"| {L['r_chart']} | {L['r_center']} | {L['r_first']} | {L['r_points']} | {L['r_evdist']} |",
+                "|---|---|---|---|---|"]
         for name in up_charts:
             ch = by_name[name]
             f = fd[fd["chart"] == name]
@@ -701,30 +779,34 @@ def write_report(path: Path, ctx: dict) -> None:
             if e is None:
                 dist = "-"
             elif e["event_idx"] < 0:
-                dist = "(no prior event)" if ctx["lang"] == "en" else "(이전 이벤트 없음)"
+                dist = "(no prior event)" if ctx.lang == "en" else "(이전 이벤트 없음)"
             else:
                 dist = f"{e['event']} @ {e['event_idx']} -> +{e['wafers_since_event']}"
-            out.append(f"| {name} | {ch.center:.4f} -> {ch.value[-1]:.4f} | {rules} @ {first} | {dist} |")
+            out.append(f"| {name} | {ch.center:.4f} -> {ch.value[-1]:.4f} | {rules} @ {first} | "
+                       f"{profile_text(profiles[name], ctx.lang)} | {dist} |")
         out.append("")
         for name in up_charts:
             ch = by_name[name]
             if ch.base not in CLASSES:
                 continue
             out += [f"### {name}", ""]
+            if profiles[name]["single"]:
+                out += [f"- {L['r_single']}", ""]
+                continue
             out += [f"- {L['r_checks']}:"] + [f"  - {c}" for c in checks_for(ch.base)]
             te = _detail_list(ch.base, "tool_evidence")
             if te:
                 out += [f"- {L['tool_evidence']}:"] + [f"  - {t}" for t in te]
             out.append("")
-    if ctx["n_down"]:
-        out += [L["r_down_note"].format(n=ctx["n_down"]), ""]
+    if ctx.n_down:
+        out += [L["r_down_note"].format(n=ctx.n_down), ""]
     if any(by_name[n].base == "LOW_CONFIDENCE" for n in up_charts):
         out += [f"## {L['r_lowconf']}", "", L["r_lowconf_text"], ""]
-    if ctx.get("group_table") is not None:
-        out += [f"## {L['r_group']}", "", "```", ctx["group_table"].to_string(index=False, float_format=lambda v: f"{v:.4f}"), "```", ""]
-    if ctx["dropped"]:
-        out += [f"## {L['r_dropped']}", ""] + [f"- {k}: {v}" for k, v in ctx["dropped"].items()] + [""]
-    out += [f"## {L['r_figure']}", "", f"![spc]({ctx['png_name']})", "", L["r_fields"], ""]
+    if ctx.group_table is not None:
+        out += [f"## {L['r_group']}", "", "```", ctx.group_table.to_string(index=False, float_format=lambda v: f"{v:.4f}"), "```", ""]
+    if ctx.dropped:
+        out += [f"## {L['r_dropped']}", ""] + [f"- {k}: {v}" for k, v in ctx.dropped.items()] + [""]
+    out += [f"## {L['r_figure']}", "", f"![spc]({ctx.png_name})", "", L["r_fields"], ""]
     path.write_text("\n".join(out), encoding="utf-8")
 
 
@@ -782,7 +864,8 @@ def demo_scenario_lines() -> list[str]:
     er_b = er + DEMO["clean_frac"] * DEMO["drift_mag"]
     sc_b = sc + DEMO["clean_frac"] * (1 - DEMO["drift_mag"]) * DEMO["step_mag"]
     return [
-        f"합성 시나리오 (로직 확인용, 성능 아님): 웨이퍼 {DEMO['n_groups'] * n:,}장, 로트 {n}장, CLEAN 약 {DEMO['clean_frac']:.0%}, "
+        f"합성 시나리오 (로직 확인용, 성능 아님): 웨이퍼 {DEMO['n_groups'] * n:,}장, 로트 {DEMO['n_groups']}개(로트당 {n}장), "
+        f"CLEAN 약 {DEMO['clean_frac']:.0%}, "
         f"결함 8종은 WM-811K 라벨 비율로 나머지 {1 - DEMO['clean_frac']:.0%} 분배, 로트가 챔버 A/B 를 번갈아 탐",
         f"  EDGE_RING 드리프트: 웨이퍼 {DEMO['drift_start'] * n}부터 {DEMO['drift_ramp']}로트({DEMO['drift_ramp'] * n}장)에 걸쳐 "
         f"B 챔버 CLEAN->EDGE_RING 전환 확률 0 -> {DEMO['drift_mag']:.2f} (B 발생률 {er:.3f} -> {er_b:.3f}, 전체 기준 {er:.3f} -> {(er + er_b) / 2:.3f})",
@@ -795,7 +878,9 @@ def demo_scenario_lines() -> list[str]:
 
 
 # ──────────────────────────────────────────
-def main(argv: list[str] | None = None) -> None:
+# 5. 실행 - parse_args -> load_input -> build -> save_tables -> plot -> print_summary -> write_report
+# ──────────────────────────────────────────
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="분류 결과에 SPC 관리도를 붙인다.")
     ap.add_argument("predictions", nargs="?", type=Path, help="예측 CSV (lot, y_pred 필수)")
     ap.add_argument("--demo", action="store_true", help="합성 시퀀스로 탐지 확인 (성능 근거 아님)")
@@ -811,46 +896,50 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-laney", action="store_true", help="Laney 과산포 보정을 끈다 (순수 이항 한계)")
     ap.add_argument("--up-only", action=argparse.BooleanOptionalAction, default=True,
                     help="하강 알람을 콘솔·점검 항목에서 제외 (alarms.csv 에는 note 와 함께 남긴다). 기본 켬")
-    ap.add_argument("--anonymize", action="store_true", help="로트명·그룹 ID 를 짧은 해시로 치환 (매핑 표 저장 안 함)")
+    ap.add_argument("--anonymize", action="store_true",
+                    help=f"로트명·그룹 ID 를 키드 해시({2 * ANON_DIGEST_SIZE}자리)로 치환 (매핑 표 저장 안 함)")
+    ap.add_argument("--anon-key-env", metavar="VAR", default=None,
+                    help=f"--anonymize 키를 읽을 환경변수 이름. 같은 사안의 초동·중간·종결 보고와 로트 리포트에 같은 키를 쓰면 "
+                         f"산출물 간 ID 가 맞는다. 지정하지 않으면 {ANON_KEY_ENV} 가 있을 때 그것, 없으면 실행마다 새 키")
     ap.add_argument("--lang", choices=["ko", "en"], default="ko", help="그림·보고서 언어. 한글 폰트가 없으면 그림만 en 으로")
     ap.add_argument("--classes", nargs="+", default=CLASSES)
     ap.add_argument("--output", type=Path, default=HERE / "spc")
     args = ap.parse_args(argv)
-    L = LABELS[args.lang]
+    if not args.demo and not args.predictions:
+        ap.error("예측 CSV 경로를 주거나 --demo 를 지정하라.")
+    args.by_lot = args.subgroup == "lot"
+    args.base_size = args.min_size if args.by_lot else (int(args.subgroup) if args.subgroup.isdigit() else 0)
+    if args.base_size < 2:
+        ap.error("--subgroup 은 'lot' 또는 2 이상의 정수여야 한다.")
+    return args
 
+
+def load_input(args: argparse.Namespace) -> tuple[pd.DataFrame, str, str]:
+    """(시간 순 예측 표, 산출물 stem, 보고서의 입력 표기). --demo 면 시나리오를 찍고, --anonymize 면 여기서 치환한다."""
     if args.demo:
         df = demo_predictions()
         stem, source = "spc_demo", "--demo (synthetic)"
         for line in demo_scenario_lines():
             print(line)
-    elif args.predictions:
+    else:
         df = load_predictions(args.predictions, args.time_col)
         stem, source = "spc_" + args.predictions.stem, args.predictions.name
-    else:
-        ap.error("예측 CSV 경로를 주거나 --demo 를 지정하라.")
-
     if args.anonymize:
-        df = anonymize_ids(df, ["lot"] + ([args.group_col] if args.group_col else []))
-        print("익명화: 로트명" + (f"·{args.group_col}" if args.group_col else "") + " 을 8자리 해시로 치환 (매핑 표는 저장하지 않음)")
+        key, key_text = resolve_anon_key(args.anon_key_env)
+        cols = ["lot"] + ([args.group_col] if args.group_col else [])
+        df = anonymize_ids(df, cols, key)
+        print(f"익명화: {'·'.join(cols)} -> {2 * ANON_DIGEST_SIZE}자리 키드 해시 (키: {key_text}; 매핑 표는 저장하지 않음)")
+    return df, stem, source
 
-    mode = chart_mode(df)
-    by_lot = args.subgroup == "lot"
-    base_size = args.min_size if by_lot else int(args.subgroup)
-    if base_size < 2:
-        ap.error("--subgroup 은 'lot' 또는 2 이상의 정수여야 한다.")
-    n_base_rows = int(len(df) * args.baseline_frac)
-    print(f"웨이퍼 {len(df):,}장, 로트 {df['lot'].nunique():,}개, 기본 부분군 {'로트 병합 >=' if by_lot else ''}{base_size}장, "
-          f"baseline 웨이퍼 0-{n_base_rows - 1}, 감시 {n_base_rows}-{len(df) - 1}")
-    print(f"관리도 종류: {L[mode]}")
-    if mode == "share":
-        print("  (예측 CSV 에 CLEAN/none 판정이 없다. wm811k_evaluate.py --with-none 출력이면 발생률 관리도가 된다)")
 
+def build(args: argparse.Namespace, df: pd.DataFrame, n_base_rows: int,
+          ) -> tuple[list[Chart], dict[str, int], dict[str, str], float | None, str]:
+    """저신뢰 임계값을 정하고 관리도를 만든다. 부분군 크기·Laney 계수·감시 불가 사유를 찍는다."""
     conf_threshold, conf_how = resolve_conf_threshold(df, n_base_rows, args.conf_threshold, args.conf_quantile)
     if conf_threshold is not None:
         src = df.attrs.get("confidence_source") or "confidence"
         print(f"저신뢰 임계값: {conf_threshold:.3f} ({conf_how}, 열={src})")
-
-    charts, sizes, dropped = build_all(df, args.classes, base_size, by_lot, n_base_rows,
+    charts, sizes, dropped = build_all(df, args.classes, args.base_size, args.by_lot, n_base_rows,
                                        conf_threshold, laney=not args.no_laney, group_col=args.group_col)
     if not charts:
         for k, v in dropped.items():
@@ -868,34 +957,64 @@ def main(argv: list[str] | None = None) -> None:
         print("감시 불가:")
         for k, v in dropped.items():
             print(f"  {k}: {v}")
+    return charts, sizes, dropped, conf_threshold, conf_how
 
-    alarms = alarm_table(charts, mode)
-    mon = alarms[alarms["phase"] == "monitor"]
-    n_down = int((mon["direction"] == "down").sum())
-    shown = mon[mon["direction"] == "up"] if args.up_only else mon
-    args.output.mkdir(parents=True, exist_ok=True)
-    alarms.to_csv(args.output / f"{stem}_alarms.csv", index=False, encoding="utf-8-sig")
+
+def save_tables(out_dir: Path, stem: str, charts: list[Chart], alarms: pd.DataFrame) -> None:
+    """<stem>_alarms.csv (현장 기록 열 포함), <stem>_subgroups.csv (부분군별 값·z·EWMA·한계)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    alarms.to_csv(out_dir / f"{stem}_alarms.csv", index=False, encoding="utf-8-sig")
     pd.concat([pd.DataFrame({"chart": ch.name, "subgroup": np.arange(len(ch.value)), "n": ch.n,
                              "wafer_end_idx": ch.end_idx, "lots": list(ch.lots) if ch.lots else "",
                              "value": ch.value, "z": ch.z, "ewma": ch.ewma, "ewma_limit": ch.ewma_limit,
                              "ucl": ch.ucl, "lcl": ch.lcl, "phase": np.where(np.arange(len(ch.value)) < ch.n_base, "baseline", "monitor")})
-               for ch in charts]).to_csv(args.output / f"{stem}_subgroups.csv", index=False, encoding="utf-8-sig")
+               for ch in charts]).to_csv(out_dir / f"{stem}_subgroups.csv", index=False, encoding="utf-8-sig")
 
-    events = event_marks(df, args.event_col, args.group_col) if args.event_col else None
-    font = setup_korean_font()
-    fig_lang = args.lang
-    if fig_lang == "ko" and font is None:
-        fig_lang = "en"
-        print("[경고] 한글 폰트를 찾지 못해 그림 라벨을 영문(en)으로 전환한다. 콘솔·보고서는 --lang 대로.")
-    FL = LABELS[fig_lang]
+
+def figure_title(args: argparse.Namespace, mode: str, lang: str) -> str:
+    FL = LABELS[lang]
     if args.demo:
         title = FL["demo_title"].format(d=DEMO["drift_start"] * DEMO["n"], l=DEMO["lowconf_start"] * DEMO["n"],
                                         s=DEMO["step_start"] * DEMO["n"])
     else:
         order = FL["order_col"].format(col=args.time_col) if args.time_col else FL["order_rows"]
         title = FL["file_title"].format(name=args.predictions.name, order=order)
-    title += "\n" + FL[mode]
-    plot_charts(charts, n_base_rows, args.output / f"{stem}.png", title, lang=fig_lang, events=events)
+    return title + "\n" + FL[mode]
+
+
+def plot(args: argparse.Namespace, charts: list[Chart], n_base_rows: int, mode: str, out_png: Path,
+         events: pd.DataFrame | None) -> None:
+    """그림 저장. 한글 폰트가 없으면 그림 라벨만 en 으로 바꾼다(콘솔·보고서는 --lang 대로)."""
+    fig_lang = args.lang
+    if fig_lang == "ko" and setup_korean_font() is None:
+        fig_lang = "en"
+        print("[경고] 한글 폰트를 찾지 못해 그림 라벨을 영문(en)으로 전환한다. 콘솔·보고서는 --lang 대로.")
+    plot_charts(charts, n_base_rows, out_png, figure_title(args, mode, fig_lang), lang=fig_lang, events=events)
+
+
+def baseline_rate_text(charts: list[Chart], alarms: pd.DataFrame) -> str:
+    """baseline 구간 알람률 '1.2% (3 / 250)'. 5% 를 넘으면 시간 순서·안정성 경고를 찍는다."""
+    base_alarms = alarms[alarms["phase"] == "baseline"]
+    n_base_points = sum(ch.n_base for ch in charts)
+    base_rate = len(base_alarms) / max(n_base_points, 1)
+    if base_rate > 0.05:
+        print(f"\n[경고] baseline 구간 알람률 {base_rate:.0%} ({len(base_alarms)}건 / {n_base_points}점). "
+              f"안정 공정이라면 규칙 5개를 다 켜도 1-2% 수준이다.\n"
+              f"  이 시퀀스는 정상 상태가 아니거나 시간 순서가 아니다. WM-811K의 행 순서는 제품·로트 블록 순서라\n"
+              f"  관리도가 공정 변화가 아니라 데이터셋 정렬을 잡는다. 실제 팹 데이터는 --time-col 로 시각을 지정하라.\n"
+              f"  탐지 로직 자체를 확인하려면 --demo 를 써라.")
+    elif not base_alarms.empty:
+        print(f"\nbaseline 구간 알람 {len(base_alarms)}건 ({base_rate:.1%}) - 우연 범위 안이면 무시, "
+              f"많으면 --baseline-frac 을 조정하거나 구간을 다시 골라라.")
+    return f"{base_rate:.1%} ({len(base_alarms)} / {n_base_points})"
+
+
+def print_summary(args: argparse.Namespace, charts: list[Chart], alarms: pd.DataFrame,
+                  events: pd.DataFrame | None, ev_dist: pd.DataFrame | None, group_table: pd.DataFrame | None) -> str:
+    """콘솔 요약: 첫 탐지 시점, 이벤트 거리, 그룹 비교, baseline 알람률, 알람 수, 패턴별 점검 항목. baseline 알람률 문자열 반환."""
+    L = LABELS[args.lang]
+    mon = alarms[alarms["phase"] == "monitor"]
+    n_up, n_down = int((mon["direction"] == "up").sum()), int((mon["direction"] == "down").sum())
 
     print(f"\n{'=' * 70}\n{L['h_first'] if args.up_only else L['h_first_all']}\n{'=' * 70}")
     fd = first_detection(alarms, up_only=args.up_only)
@@ -907,68 +1026,92 @@ def main(argv: list[str] | None = None) -> None:
     if args.up_only and n_down:
         print(f"  하강 알람 {n_down}건은 제외 (alarms.csv 의 note 열 참조)")
 
-    ev_dist = None
     if events is not None:
-        ev_dist = event_distance(charts, alarms, events)
         print(f"\n{'=' * 70}\n{L['h_event']}\n{'=' * 70}")
-        print("  이벤트 " + ", ".join(f"{int(r['idx'])}:{r['label']}" + (f"@{r['group']}" if r["group"] is not None else "")
-                                   for _, r in events.iterrows()))
-        print(ev_dist.to_string(index=False) if not ev_dist.empty else "  " + L["none"])
+        if events.empty:
+            print("  " + L["r_no_events"])
+        else:
+            print("  이벤트 " + ", ".join(f"{int(r['idx'])}:{r['label']}" + (f"@{r['group']}" if r["group"] is not None else "")
+                                       for _, r in events.iterrows()))
+            print(ev_dist.to_string(index=False) if ev_dist is not None and not ev_dist.empty else "  " + L["none"])
 
-    group_table = None
-    if args.group_col:
-        group_table = group_rate_test(df, args.group_col, args.classes, n_base_rows)
+    if group_table is not None:
         print(f"\n{'=' * 70}\n{L['h_group']}\n{'=' * 70}")
         print(group_table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
-    base_alarms = alarms[alarms["phase"] == "baseline"]
-    n_base_points = sum(ch.n_base for ch in charts)
-    base_rate = len(base_alarms) / max(n_base_points, 1)
-    base_rate_text = f"{base_rate:.1%} ({len(base_alarms)} / {n_base_points})"
-    if base_rate > 0.05:
-        print(f"\n[경고] baseline 구간 알람률 {base_rate:.0%} ({len(base_alarms)}건 / {n_base_points}점). "
-              f"안정 공정이라면 규칙 5개를 다 켜도 1-2% 수준이다.\n"
-              f"  이 시퀀스는 정상 상태가 아니거나 시간 순서가 아니다. WM-811K의 행 순서는 제품·로트 블록 순서라\n"
-              f"  관리도가 공정 변화가 아니라 데이터셋 정렬을 잡는다. 실제 팹 데이터는 --time-col 로 시각을 지정하라.\n"
-              f"  탐지 로직 자체를 확인하려면 --demo 를 써라.")
-    elif not base_alarms.empty:
-        print(f"\nbaseline 구간 알람 {len(base_alarms)}건 ({base_rate:.1%}) - 우연 범위 안이면 무시, "
-              f"많으면 --baseline-frac 을 조정하거나 구간을 다시 골라라.")
-    pre = mon[(mon["direction"] == "up")]
-    print(f"감시 구간 상승 알람 {int((mon['direction'] == 'up').sum())}건, 하강 {n_down}건 "
+    base_rate_text = baseline_rate_text(charts, alarms)
+    print(f"감시 구간 상승 알람 {n_up}건, 하강 {n_down}건 "
           f"(관리도 {len(charts)}개, 감시 점 {sum(len(ch.value) - ch.n_base for ch in charts)}개)")
 
-    # 패턴별 조치 - 상승 방향 알람이 있는 결함 패턴만
-    up_charts = [ch for ch in charts if ch.name in set(shown[shown["direction"] == "up"]["chart"])]
+    # 패턴별 조치 - 상승 방향 알람이 있는 결함 패턴만. R1 1점뿐인 단발 알람은 점검 목록 대신 한 줄.
+    up_names = set(mon.loc[mon["direction"] == "up", "chart"])
+    up_charts = [ch for ch in charts if ch.name in up_names]
     up_patterns = [ch for ch in up_charts if ch.base in args.classes]
     if up_patterns:
         print(f"\n{'=' * 70}\n{L['h_actions']}\n{'=' * 70}")
         for ch in up_patterns:
+            p = alarm_profile(ch.name, alarms)
+            if p["single"]:
+                print(f"  {ch.name:14s} [{profile_text(p, args.lang)}] {L['r_single']}")
+                continue
             checks = checks_for(ch.base)
-            print(f"  {ch.name:14s} " + ("; ".join(checks) if checks else ""))
+            print(f"  {ch.name:14s} [{profile_text(p, args.lang)}] " + "; ".join(checks))
             te = _detail_list(ch.base, "tool_evidence")
             if te:
                 print(f"  {'':14s} {L['tool_evidence']}: " + "; ".join(te))
     if any(ch.base == "LOW_CONFIDENCE" for ch in up_charts):
         print("  LOW_CONFIDENCE 저신뢰 웨이퍼 증가 - 새 패턴 출현 또는 분류기 노후. 저신뢰 웨이퍼를 직접 검토하라.")
+    return base_rate_text
 
-    settings = [f"subgroup={'lot>=' if by_lot else ''}{base_size}", f"baseline_frac={args.baseline_frac}",
-                f"EWMA lambda={EWMA_LAMBDA} L={EWMA_L}", "Laney=" + ("off" if args.no_laney else f"on (n_base>={LANEY_MIN_BASE})"),
-                f"up_only={args.up_only}"]
+
+def settings_text(args: argparse.Namespace, conf_threshold: float | None, conf_how: str) -> str:
+    """보고서 '설정' 줄 (handoff: 관리도 설정은 보고서 머리에 남긴다)."""
+    s = [f"subgroup={'lot>=' if args.by_lot else ''}{args.base_size}", f"baseline_frac={args.baseline_frac}",
+         f"EWMA lambda={EWMA_LAMBDA} L={EWMA_L}", "Laney=" + ("off" if args.no_laney else f"on (n_base>={LANEY_MIN_BASE})"),
+         f"up_only={args.up_only}"]
     if conf_threshold is not None:
-        settings.append(f"conf_threshold={conf_threshold:.3f} ({conf_how})")
+        s.append(f"conf_threshold={conf_threshold:.3f} ({conf_how})")
     if args.group_col:
-        settings.append(f"group_col={args.group_col}")
+        s.append(f"group_col={args.group_col}")
     if args.event_col:
-        settings.append(f"event_col={args.event_col}")
+        s.append(f"event_col={args.event_col}")
     if args.anonymize:
-        settings.append("anonymized ids")
-    write_report(args.output / f"{stem}_report.md", dict(
+        s.append("anonymized ids")
+    return ", ".join(s)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    L = LABELS[args.lang]
+    df, stem, source = load_input(args)
+
+    mode = chart_mode(df)
+    n_base_rows = int(len(df) * args.baseline_frac)
+    print(f"웨이퍼 {len(df):,}장, 로트 {df['lot'].nunique():,}개, 기본 부분군 {'로트 병합 >=' if args.by_lot else ''}{args.base_size}장, "
+          f"baseline 웨이퍼 0-{n_base_rows - 1}, 감시 {n_base_rows}-{len(df) - 1}")
+    print(f"관리도 종류: {L[mode]}")
+    if mode == "share":
+        print("  (예측 CSV 에 CLEAN/none 판정이 없다. wm811k_evaluate.py --with-none 출력이면 발생률 관리도가 된다)")
+
+    charts, sizes, dropped, conf_threshold, conf_how = build(args, df, n_base_rows)
+    alarms = alarm_table(charts, mode)
+    save_tables(args.output, stem, charts, alarms)
+
+    events = event_marks(df, args.event_col, args.group_col) if args.event_col else None
+    plot(args, charts, n_base_rows, mode, args.output / f"{stem}.png", events)
+    ev_dist = event_distance(charts, alarms, events) if events is not None else None
+    group_table = group_rate_test(df, args.group_col, args.classes, n_base_rows) if args.group_col else None
+    base_rate_text = print_summary(args, charts, alarms, events, ev_dist, group_table)
+
+    mon = alarms[alarms["phase"] == "monitor"]
+    n_down = int((mon["direction"] == "down").sum())
+    write_report(args.output / f"{stem}_report.md", RunContext(
         lang=args.lang, stem=stem, source=source, synthetic=args.demo, mode=mode,
         range_text=f"{len(df):,} wafers, {df['lot'].nunique():,} lots; baseline 0-{n_base_rows - 1}, monitor {n_base_rows}-{len(df) - 1}",
-        settings_text=", ".join(settings), base_rate_text=base_rate_text, charts=charts,
+        settings_text=settings_text(args, conf_threshold, conf_how), base_rate_text=base_rate_text, charts=charts,
         alarms=alarms if not args.up_only else alarms[(alarms["direction"] == "up") | (alarms["phase"] == "baseline")],
-        n_down=n_down if args.up_only else 0, event_dist=ev_dist, group_table=group_table, dropped=dropped,
+        n_down=n_down if args.up_only else 0, event_dist=ev_dist,
+        n_events=len(events) if events is not None else None, group_table=group_table, dropped=dropped,
         png_name=f"{stem}.png"))
 
     print(f"\n저장: {args.output / (stem + '.png')}\n      {args.output / (stem + '_subgroups.csv')}"

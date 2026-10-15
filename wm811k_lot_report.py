@@ -45,14 +45,16 @@
 #   wafer_pattern_classifier.ACTION_DETAIL 한 곳에서만 가져와 docs 와 어긋나지 않게 한다.
 #
 # 한계 (중요)
-#   - 합성(--demo, tests/)은 로직 확인이지 성능이 아니다. 판정 임계값(0.5, 3장, 0.7 등)은 운용 규칙이지
-#     실측으로 최적화한 값이 아니다.
+#   - 합성(--demo, tests/)은 로직 확인이지 성능이 아니다. 판정 임계값(0.5, 3장 등)은 운용 규칙이지
+#     실측으로 최적화한 값이 아니다. 저신뢰 임계값은 고정값이 아니라 입력 예측 전체 confidence 의 분위수
+#     (q0.10, wm811k_spc 와 같은 규칙)이며 분포가 없을 때만 고정 0.7 로 물러난다 - 헤더에 근거를 찍는다.
 #   - 노치 방향(기본 -90도)은 가정이다(wm811k_azimuth 와 동일). 리포트에 명시한다.
 #   - wafer_index 는 물리 슬롯의 '대리 변수'다(wm811k_slot 과 동일). 슬롯 블록은 로트 안 분포만 보여주고,
 #     끝 슬롯 검정은 로트 하나로는 못 하므로 wm811k_slot.py 를 전체 예측에 돌리라고 적는다.
 #   - 격자 반복 휴리스틱(grid_repeat_score)은 1차원 자기상관의 2차 피크를 보는 것이라 '의심' 표시까지다.
 #   - ACTION_DETAIL 의 장비 서술은 공개 자료 기준이며 TEL 내부 구현·PM 주기는 모른다. 고객 데이터·실제
-#     장비 식별자는 쓰지 않는다. --anonymize 는 로트명을 키드 해시로 바꾼다(매핑 표 미저장).
+#     장비 식별자는 쓰지 않는다. --anonymize 는 로트명과 공통성 상위의 장비·챔버 ID 를 키드 해시로 바꾼다
+#     (공정 단계명은 유지, 매핑 표 미저장). 점검 문구(ACTION_DETAIL)에는 실제 ID 가 없다.
 #
 # 사용법
 #   python wm811k_lot_report.py --demo --output lot_demo                      # 합성 로트 3개 -> PDF 3 + JSON 3
@@ -68,7 +70,8 @@ import math
 import os
 import sys
 import textwrap
-from dataclasses import asdict, dataclass, field
+import hashlib
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -79,17 +82,18 @@ import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.colors import to_rgb
 
-from _fonts import has_korean_font, setup_korean_font
-from batch_wafer_report import anonymize_lot_id
+from _fonts import setup_korean_font
+from batch_wafer_report import anonymize_lot_id, resolve_lang  # noqa: F401  (resolve_lang 재export: make_figures 가 쓴다)
 from wafer_map_visualizer import FAIL_COLOR, PASS_COLOR
-from wafer_pattern_classifier import ACTION_DETAIL, SEVERITY_LABEL
+from wafer_pattern_classifier import ACTION_DETAIL
 from wm811k_azimuth import (
-    DEFAULT_NOTCH_DEG, NOTCH_NOTE, load_records, lot_azimuth_summary, plot_azimuth_rose,
-    wafer_azimuth_table, wafer_frame,
+    DEFAULT_NOTCH_DEG, NOTCH_NOTE, join_note, join_predictions, load_records, lot_azimuth_summary,
+    plot_azimuth_rose, wafer_azimuth_table, wafer_frame,
 )
 from wm811k_commonality import commonality_table, load_lot_history, lot_pattern_status
 from wm811k_scratch_shape import lot_scratch_summary, wafer_scratch_table
 from wm811k_slot import DEFAULT_END_SLOTS, SLOT_NOTE, slot_rate_table
+from wm811k_spc import resolve_conf_threshold
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -97,7 +101,14 @@ if sys.platform == "win32":
 
 HERE = Path(__file__).resolve().parent
 A4_PORTRAIT = (8.27, 11.69)
-LOW_CONF = 0.7                    # wm811k_spc 의 저신뢰 기준과 같다
+# 저신뢰 임계값 운용 규칙 (resolve_low_conf_threshold): --conf-threshold 명시값 > 입력 예측 전체 confidence 의
+# 하위 분위수(CONF_QUANTILE, wm811k_spc 의 기본 규칙과 같다; 유효 행이 MIN_N_CONF_QUANTILE 이상일 때) > 고정값.
+# 로트 1개만 있으면 분위수를 낼 분포가 없으므로 고정값 LOW_CONF_FALLBACK 을 쓰고, 헤더에 어느 근거인지 찍는다.
+# SPC 는 '시간 순서 baseline 구간'의 분위수라 같은 예측이라도 값이 다를 수 있다 - 두 값을 맞추려면
+# wm811k_spc 가 채택한 임계값을 --conf-threshold 로 넘긴다.
+LOW_CONF_FALLBACK = 0.7
+CONF_QUANTILE = 0.10
+MIN_N_CONF_QUANTILE = 30
 MIN_N_REPEAT = 3                  # 로트 판정에 필요한 최소 장수
 PROCESS_FRAC = 0.5                # 지배 패턴 비율이 이 이상이면 '공정 조건'
 EVENT_MAX = 2                     # 지배 패턴이 이 장수 이하면 '이벤트'
@@ -130,9 +141,13 @@ LABELS: dict[str, dict[str, str]] = {
         "hdr_n": "웨이퍼 {n}장 (라벨 있는 것 전부)",
         "hdr_ff": "평균 불량률 {ff:.1%}  (최저 {lo:.1%} / 최고 {hi:.1%})",
         "hdr_dom": "지배 패턴 {p} {k}/{n} -> {rep}",
-        "hdr_low": "저신뢰(confidence < {t:g}) {k}장",
+        "hdr_low": "저신뢰(confidence < {t:.2f}) {k}장",
+        "hdr_low_basis": "   임계값 근거: {basis}",
         "hdr_low_none": "confidence 열 없음 - 저신뢰 집계 생략",
-        "hdr_anon": "로트명 키드 해시 익명화 (매핑 표 미저장)",
+        "conf_basis": {"explicit": "--conf-threshold 지정값",
+                       "quantile": "입력 예측 {n}장의 q{q:.2f}, wm811k_spc 와 같은 분위수 규칙",
+                       "fixed": "고정값, 분위수를 낼 분포 없음(유효 {n}장 < {min_n})"},
+        "hdr_anon": "로트명·장비·챔버 ID 키드 해시 익명화 (공정 단계명은 유지, 매핑 표 미저장)",
         "mix_title": "패턴 믹스",
         "thumb_title": "웨이퍼 썸네일 (슬롯 순, 노치 = 회색 삼각형, 가정 notch_deg={notch:g})",
         "thumb_more": "(썸네일 {a}~{b}장, 다음 페이지에 계속)",
@@ -153,6 +168,7 @@ LABELS: dict[str, dict[str, str]] = {
         "v_cm_pass": "  <- 이 로트 통과", "v_cm_nopass": "",
         "v_cm_note": "공통성은 상관이지 인과가 아니다. q >= 0.05 면 지목 근거가 약하다 - 지목 장비의 PM·부품 이력과 시점을 맞댄다.",
         "v_cm_none": "공통성: 이력 없음 (--history 로 docs/lot_history_schema.md 형식 CSV 를 주면 상위 3개 장비를 낸다)",
+        "v_cm_skip": "공통성 생략 - 이력과 로트 불일치: {why}",
         "h_excl": "2. 테스트 원인 배제 / Rule out test causes first",
         "excl_none": "해당 플래그 없음 (NEAR_FULL 없음, 격자 반복 의심 없음).",
         "h_susp": "3. 의심 모듈과 점검 순서 / Suspected modules, check order   - {p} x {combo}",
@@ -170,7 +186,6 @@ LABELS: dict[str, dict[str, str]] = {
         "pdf_title": "Lot troubleshooting report {lot}{syn}",
         "c_saved": "저장: {pdf}, {js}",
         "c_demo": "[demo] 합성 로트 3개: {lots}. 로직 확인이지 성능이 아니다.",
-        "c_font_none": "[경고] 한글 폰트를 찾지 못해 리포트 언어를 en 으로 전환한다.",
     },
     "en": {
         "title": "Lot Troubleshooting Report",
@@ -179,9 +194,13 @@ LABELS: dict[str, dict[str, str]] = {
         "hdr_n": "{n} wafers (all labeled wafers in the lot)",
         "hdr_ff": "mean fail fraction {ff:.1%}  (min {lo:.1%} / max {hi:.1%})",
         "hdr_dom": "dominant pattern {p} {k}/{n} -> {rep}",
-        "hdr_low": "low confidence (< {t:g}): {k} wafers",
+        "hdr_low": "low confidence (< {t:.2f}): {k} wafers",
+        "hdr_low_basis": "   threshold basis: {basis}",
         "hdr_low_none": "no confidence column - low-confidence count skipped",
-        "hdr_anon": "lot name anonymized with a keyed hash (mapping not stored)",
+        "conf_basis": {"explicit": "--conf-threshold as given",
+                       "quantile": "q{q:.2f} of {n} input predictions, same quantile rule as wm811k_spc",
+                       "fixed": "fixed value, no distribution for a quantile ({n} valid < {min_n})"},
+        "hdr_anon": "lot, tool and chamber ids anonymized with a keyed hash (step names kept, mapping not stored)",
         "mix_title": "pattern mix",
         "thumb_title": "wafer thumbnails (slot order, notch = grey triangle, assumed notch_deg={notch:g})",
         "thumb_more": "(thumbnails {a}-{b}, continued on next page)",
@@ -202,6 +221,7 @@ LABELS: dict[str, dict[str, str]] = {
         "v_cm_pass": "  <- this lot passed through", "v_cm_nopass": "",
         "v_cm_note": "Commonality is correlation, not cause. q >= 0.05 means weak evidence - match the unit's PM / part history and timing.",
         "v_cm_none": "commonality: no lot history (pass --history CSV in docs/lot_history_schema.md format for top-3 tools)",
+        "v_cm_skip": "commonality skipped - history and lots do not match: {why}",
         "h_excl": "2. Rule out test causes first",
         "excl_none": "No flag (no NEAR_FULL, no grid-repeat suspicion).",
         "h_susp": "3. Suspected modules and check order   - {p} x {combo}",
@@ -220,7 +240,6 @@ LABELS: dict[str, dict[str, str]] = {
         "pdf_title": "Lot troubleshooting report {lot}{syn}",
         "c_saved": "saved: {pdf}, {js}",
         "c_demo": "[demo] 3 synthetic lots: {lots}. Logic check, not performance.",
-        "c_font_none": "[warning] Korean font not found - switching report language to en.",
     },
 }
 SEVERITY_EN = {"monitor": "monitor", "lot_hold": "lot hold review", "line_stop_review": "line stop review"}
@@ -268,6 +287,10 @@ class LotFindings:
     synthetic: bool
     wafers: list[dict] = field(default_factory=list)
     label_source: str = "y_pred"
+    conf_threshold: float = LOW_CONF_FALLBACK      # 저신뢰 임계값 (resolve_low_conf_threshold)
+    conf_threshold_basis: str = "fixed"            # 'explicit' | 'quantile' | 'fixed'
+    conf_threshold_n: int = 0                      # 분위수 계산에 쓴 유효 confidence 수
+    commonality_note: str = ""                     # 이력이 있는데 공통성을 못 낸 이유 (없으면 '')
 
 
 # ──────────────────────────────────────────
@@ -355,11 +378,14 @@ def _longest_run(slots: list[int]) -> int:
     return best
 
 
-def _lot_frame(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: str) -> tuple[pd.DataFrame, str]:
+def _lot_frame(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: str,
+               verbose: bool = False) -> tuple[pd.DataFrame, str]:
     """로트 하나의 (waferMap, lot, wafer_index, y_pred, confidence) 표와 라벨 출처.
 
-    preds_df 가 있으면 (lot, wafer_index) 키로, 양쪽에 wafer_index 가 없으면 행 순서로 결합한다.
-    preds_df 가 None 이면 records 의 y_pred 또는 y_true 를 쓴다. 라벨 없는 웨이퍼는 제외한다.
+    preds_df 가 있으면 wm811k_azimuth.join_predictions 로 결합한다((lot, wafer_index) 키 -> 로트 안 행 순서;
+    어느 한쪽의 wafer_index 결측은 순서 결합으로 넘어간다). 예측이 로트의 어느 행에도 맞지 않으면 ValueError
+    (결측 장수·행 수를 문구에 적는다). preds_df 가 None 이면 records 의 y_pred 또는 y_true 를 쓴다.
+    라벨 없는 웨이퍼는 제외한다.
     """
     rec = records_df[records_df["lot"].astype(str) == str(lot)].copy()
     if len(rec) == 0:
@@ -371,19 +397,16 @@ def _lot_frame(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: str
     if preds_df is not None:
         if "y_pred" not in preds_df.columns or "lot" not in preds_df.columns:
             raise ValueError("preds_df 에 lot, y_pred 열이 필요하다.")
-        p = preds_df[preds_df["lot"].astype(str) == str(lot)].copy()
-        keep = [c for c in ("y_pred", "confidence") if c in p.columns]
-        if "wafer_index" in p.columns and rec["wafer_index"].notna().all():
-            p["wafer_index"] = pd.to_numeric(p["wafer_index"], errors="coerce")
-            p = p.drop_duplicates(["wafer_index"])
-            rec = rec.drop(columns=[c for c in keep if c in rec.columns], errors="ignore")
-            rec = rec.merge(p[["wafer_index"] + keep], on="wafer_index", how="left")
-        elif len(p) == len(rec):
-            for c in keep:
-                rec[c] = p[c].to_numpy()
-        else:
-            raise ValueError(f"로트 {lot!r}: 예측을 결합할 수 없다 (wafer_index 가 없고 행 수도 다르다: "
-                             f"{len(p)} vs {len(rec)}).")
+        p = preds_df[preds_df["lot"].astype(str) == str(lot)]
+        if len(p) == 0:
+            raise ValueError(f"예측 CSV 에 로트 {lot!r} 행이 없다 (records 에는 {len(rec)}장).")
+        try:
+            rec, info = join_predictions(rec, p)
+        except ValueError as e:
+            raise ValueError(f"로트 {lot!r}: {e}") from None
+        note = join_note(info)
+        if note and verbose:
+            print(f"{note} (로트 {lot})")
         src = "y_pred"
     elif "y_pred" in rec.columns:
         src = "y_pred"
@@ -457,14 +480,31 @@ def _find_checks(pattern: str, keywords: list[str]) -> list[tuple[int, str]]:
     return out
 
 
+MODULE_LABEL_MAX_LEN = 40
+MODULE_LABEL_KEYWORDS = ("TEL", "/", "Tactras", "CLEAN TRACK", "Triase", "CELLESTA", "EXPEDIUS", "Precio",
+                         "VHF", "모든", "프로브", "CMP")
+
+
+def split_check(check: str) -> tuple[str, str]:
+    """점검 문구를 (모듈 라벨, 본문) 으로 가른다. 라벨이 없으면 ('common', 원문).
+
+    라벨 = 첫 ':' 앞 머리글이 40자 이하이고 장비·모듈 키워드를 담고 여는 괄호가 없는 경우만.
+    ':' 가 아예 없으면(DONUT 의 '타사 CMP 다존 헤드 존 경계(인계)') 키워드가 있어도 라벨이 아니고,
+    괄호 안의 ':' (CENTER 의 '... RF 정재파(center-high: 전극 지름이 ...)') 도 라벨 경계가 아니다.
+    """
+    if ":" not in check:
+        return "common", check
+    head, body = check.split(":", 1)
+    head = head.strip()
+    if (len(head) <= MODULE_LABEL_MAX_LEN and "(" not in head
+            and any(k in head for k in MODULE_LABEL_KEYWORDS)):
+        return head, body.strip()
+    return "common", check
+
+
 def _module_of(check: str) -> str:
-    """점검 문구 앞의 모듈 라벨(':' 앞)을 뽑는다. 없으면 '공통'."""
-    head = check.split(":")[0]
-    if len(head) <= 40 and ("TEL" in head or "/" in head or "Tactras" in head or "CLEAN TRACK" in head
-                            or "Triase" in head or "CELLESTA" in head or "EXPEDIUS" in head or "Precio" in head
-                            or "VHF" in head or "모든" in head or "프로브" in head or "CMP" in head):
-        return head.strip()
-    return "common"
+    """점검 문구 앞의 모듈 라벨. 없으면 'common'. (split_check 의 첫 원소)"""
+    return split_check(check)[0]
 
 
 def rank_suspects(dominant: str, repeat: str, az_verdict: str | None, sc_verdict: str | None,
@@ -527,8 +567,7 @@ def rank_suspects(dominant: str, repeat: str, az_verdict: str | None, sc_verdict
             picked.append((i, c, basis_default))
     out = []
     for r, (i, c, b) in enumerate(picked, 1):
-        mod = _module_of(c)
-        body = c.split(":", 1)[1].strip() if mod != "common" else c
+        mod, body = split_check(c)
         out.append({"rank": r, "module": mod, "check": body, "basis": b,
                     "source": "rule_out_first" if i < 0 else f"first_checks[{i}]"})
     return out
@@ -585,9 +624,36 @@ def make_d2_draft(lot: str, n: int, dominant: str, k: int, repeat: str, ff: floa
 # ──────────────────────────────────────────
 # 3. 로트 분석
 # ──────────────────────────────────────────
+def resolve_low_conf_threshold(conf_source: pd.DataFrame | None, threshold: float | None = None,
+                               quantile: float = CONF_QUANTILE) -> tuple[float, str, int]:
+    """저신뢰 임계값 (값, 근거 키, 유효 confidence 수).
+
+    threshold 명시 -> ('explicit'); 아니면 conf_source(보통 예측 CSV 전체) 의 유효 confidence 가
+    MIN_N_CONF_QUANTILE 이상일 때 그 하위 quantile (wm811k_spc.resolve_conf_threshold 와 같은 계산, 'quantile');
+    그마저 없으면 LOW_CONF_FALLBACK ('fixed'). 로트 하나만 넘기면 보통 'fixed' 가 된다.
+    """
+    if threshold is not None:
+        return float(threshold), "explicit", 0
+    if conf_source is not None and "confidence" in conf_source.columns:
+        conf = pd.to_numeric(conf_source["confidence"], errors="coerce").to_numpy(dtype=float)
+        conf = conf[np.isfinite(conf)]
+        if len(conf) >= MIN_N_CONF_QUANTILE:
+            t, _ = resolve_conf_threshold(pd.DataFrame({"confidence": conf}), len(conf), None, quantile)
+            return float(t), "quantile", int(len(conf))
+        return LOW_CONF_FALLBACK, "fixed", int(len(conf))
+    return LOW_CONF_FALLBACK, "fixed", 0
+
+
+def conf_basis_text(f: LotFindings, L: dict) -> str:
+    """헤더용 임계값 근거 문구 (LABELS[lang]['conf_basis'])."""
+    return L["conf_basis"][f.conf_threshold_basis].format(n=f.conf_threshold_n, q=CONF_QUANTILE,
+                                                          min_n=MIN_N_CONF_QUANTILE)
+
+
 def analyze_lot(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: str,
                 history: pd.DataFrame | None = None, notch_deg: float = DEFAULT_NOTCH_DEG,
-                synthetic: bool = False) -> LotFindings:
+                synthetic: bool = False, conf_threshold: float | None = None,
+                conf_quantile: float = CONF_QUANTILE, verbose: bool = False) -> LotFindings:
     """로트 하나를 분석해 LotFindings 를 만든다.
 
     Parameters
@@ -596,11 +662,17 @@ def analyze_lot(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: st
     preds_df   : lot, wafer_index(선택), y_pred, confidence(선택). None 이면 records 의 y_pred/y_true.
     lot        : 분석할 로트명
     history    : 로트 이력(lot, step, tool, chamber ...). 공통성은 preds_df 전체(모든 로트)로 계산한다.
+                 이력과 예측의 로트가 하나도 겹치지 않으면 공통성만 생략하고(commonality_note) 리포트는 만든다.
     notch_deg  : 맵 좌표계에서 노치 방향(도). 기본 -90 은 가정.
     synthetic  : 합성 데이터 표시(PDF 배너·JSON 필드)
+    conf_threshold : 저신뢰 임계값. None 이면 resolve_low_conf_threshold (예측 전체 분위수, 없으면 고정값).
+    conf_quantile  : 그 분위수 (기본 0.10, wm811k_spc 와 같다)
+    verbose    : 결합·공통성 주의 문구를 콘솔에 찍는다
     """
-    rec, src = _lot_frame(records_df, preds_df, lot)
+    rec, src = _lot_frame(records_df, preds_df, lot, verbose=verbose)
     n = int(len(rec))
+    conf_src = preds_df if preds_df is not None else records_df
+    low_conf, conf_basis, conf_n = resolve_low_conf_threshold(conf_src, conf_threshold, conf_quantile)
     mix_counts = rec["y_pred"].value_counts()
     mix = {k: int(mix_counts[k]) for k in sorted(mix_counts.index, key=lambda k: (-mix_counts[k], k))}
     defect = {k: v for k, v in mix.items() if k != "CLEAN"}
@@ -611,7 +683,7 @@ def analyze_lot(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: st
     ff = rec["waferMap"].apply(lambda m: fail_fraction(np.asarray(m))).to_numpy(dtype=float)
     conf = rec["confidence"].to_numpy(dtype=float)
     has_conf = bool(np.isfinite(conf).any())
-    n_low = int((conf < LOW_CONF).sum()) if has_conf else None
+    n_low = int((conf < low_conf).sum()) if has_conf else None
 
     # 웨이퍼별 표 + 격자 반복 휴리스틱
     grids = []
@@ -679,13 +751,19 @@ def analyze_lot(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: st
 
     # 공통성 (이력이 있을 때, 모든 로트의 예측으로)
     cm_top: list[dict] = []
+    cm_note = ""
     if history is not None and dominant != "CLEAN":
         base = preds_df if preds_df is not None else records_df
         if "y_pred" not in base.columns and "y_true" in base.columns:
             base = base.rename(columns={"y_true": "y_pred"})
         status = lot_pattern_status(base, dominant)
-        if len(status):
-            tab = commonality_table(history, status)
+        try:
+            tab = commonality_table(history, status) if len(status) else None
+        except ValueError as e:                     # 이력과 예측의 로트가 하나도 안 겹침 - 리포트는 만든다
+            tab, cm_note = None, str(e)
+            if verbose:
+                print(f"[주의] 공통성 생략: {e}")
+        if tab is not None:
             lot_hist = history[history["lot"].astype(str) == str(lot)]
             ch = lot_hist["chamber"].astype(str) if "chamber" in lot_hist.columns else pd.Series("", index=lot_hist.index)
             ok = tab[tab["evidence"] == "ok"].head(3)
@@ -718,6 +796,8 @@ def analyze_lot(records_df: pd.DataFrame, preds_df: pd.DataFrame | None, lot: st
         commonality_top=cm_top, test_exclusion_flags=flags, suspects=suspects, ocap_level=lvl,
         ocap_reason=why, evidence=evidence, handoff=str(d.get("handoff", "")), d2_draft=d2,
         notch_deg=float(notch_deg), synthetic=bool(synthetic), wafers=wafers, label_source=src,
+        conf_threshold=float(low_conf), conf_threshold_basis=conf_basis, conf_threshold_n=conf_n,
+        commonality_note=cm_note,
     )
 
 
@@ -742,13 +822,38 @@ def _jsonable(v):
     return str(v)
 
 
+def anonymize_unit_id(value: str, salt: bytes, prefix: str) -> str:
+    """장비·챔버 ID 를 키드 해시 8 hex 로 (batch_wafer_report.anonymize_lot_id / wm811k_spc.anonymize_ids 와
+    같은 blake2b 키드 해시). 같은 salt 면 같은 값, 매핑 표는 저장하지 않는다. 빈 값은 빈 값."""
+    if not str(value):
+        return ""
+    return prefix + hashlib.blake2b(str(value).encode("utf-8"), key=salt, digest_size=4).hexdigest()
+
+
+def anonymize_commonality(cm_top: list[dict], salt: bytes) -> list[dict]:
+    """commonality_top 의 tool / chamber 를 해시로 바꾼 복사본. step(공정 단계명)은 장비 ID 가 아니라 유지한다."""
+    out = []
+    for r in cm_top:
+        r = dict(r)
+        r["tool"] = anonymize_unit_id(r.get("tool", ""), salt, "TOOL-")
+        r["chamber"] = anonymize_unit_id(r.get("chamber", ""), salt, "CH-")
+        out.append(r)
+    return out
+
+
 def findings_to_json(findings: LotFindings, anonymize: bool = False, salt: bytes | None = None) -> dict:
-    """LotFindings -> JSON 직렬화 가능한 dict (NaN -> null, numpy -> 기본형). 메타·면책 문구를 붙인다."""
+    """LotFindings -> JSON 직렬화 가능한 dict (NaN -> null, numpy -> 기본형). 메타·면책 문구를 붙인다.
+
+    anonymize 면 로트명과 commonality_top 의 tool/chamber 를 같은 salt 의 키드 해시로 바꾼다
+    (docs/handoff.md 4절: 장비/챔버 ID 는 저장소에 남기지 않는다).
+    """
     d = _jsonable(asdict(findings))
     if anonymize:
-        d["lot"] = anonymize_lot_id(findings.lot, salt or os.urandom(8))
+        salt = salt or os.urandom(8)
+        d["lot"] = anonymize_lot_id(findings.lot, salt)
         d["anonymized"] = True
         d["d2_draft"] = d["d2_draft"].replace(findings.lot, d["lot"])
+        d["commonality_top"] = _jsonable(anonymize_commonality(findings.commonality_top, salt))
     else:
         d["anonymized"] = False
     d["ocap_label"] = OCAP_LEVELS[findings.ocap_level]
@@ -914,7 +1019,7 @@ def draw_thumbnail(ax, arr: np.ndarray, title: str, notch_deg: float, color: str
     ax.set_title(title, fontsize=6.5, pad=2, color=color)
 
 
-def _wafer_title(w: dict) -> tuple[str, str]:
+def _wafer_title(w: dict, low_conf: float = LOW_CONF_FALLBACK) -> tuple[str, str]:
     idx = f"w{w['wafer_index']:02d}" if w["wafer_index"] is not None else "w?"
     s = f"{idx} {w['y_pred']}"
     if w["confidence"] is not None:
@@ -927,7 +1032,7 @@ def _wafer_title(w: dict) -> tuple[str, str]:
     if w.get("grid_repeat", {}).get("suspect"):
         extra.append("grid?")
     s += f"\n{w['fail_frac']:.1%}" + (f" {' '.join(extra)}" if extra else "")
-    color = "#C62828" if (w["confidence"] is not None and w["confidence"] < LOW_CONF) else "#263238"
+    color = "#C62828" if (w["confidence"] is not None and w["confidence"] < low_conf) else "#263238"
     return s, color
 
 
@@ -944,18 +1049,25 @@ def _header(fig, f: LotFindings, shown_lot: str, L: dict, lang: str, anonymized:
     ax.add_patch(plt.Rectangle((0.045, 0.918), 0.91, 0.022, facecolor=bg, edgecolor=edge, linewidth=0.8))
     ax.text(0.051, 0.929, banner, fontsize=7.5, va="center", ha="left", color=fg)
     rep = REPEAT_TEXT.get(f.repeat_verdict, REPEAT_TEXT["insufficient"])[lang]
-    lines = [L["hdr_n"].format(n=f.n),
-             L["hdr_ff"].format(ff=f.mean_fail_frac, lo=f.min_fail_frac, hi=f.max_fail_frac),
-             L["hdr_dom"].format(p=f.dominant, k=f.dominant_count, n=f.n, rep=rep),
-             L["hdr_low"].format(t=LOW_CONF, k=f.n_low_conf) if f.n_low_conf is not None else L["hdr_low_none"],
-             f"OCAP: {OCAP_LEVELS[f.ocap_level][lang]}"]
+    # (문구, 크기, 굵게, 색). 패턴 믹스 막대(x >= 0.62)와 같은 높이라 한 줄은 짧게 둔다.
+    lines: list[tuple[str, float, bool, str]] = [
+        (L["hdr_n"].format(n=f.n), 8.5, False, _Flow.INK),
+        (L["hdr_ff"].format(ff=f.mean_fail_frac, lo=f.min_fail_frac, hi=f.max_fail_frac), 8.5, False, _Flow.INK),
+        (L["hdr_dom"].format(p=f.dominant, k=f.dominant_count, n=f.n, rep=rep), 8.5, True, _Flow.INK),
+    ]
+    if f.n_low_conf is not None:
+        lines.append((L["hdr_low"].format(t=f.conf_threshold, k=f.n_low_conf), 7.5, False, _Flow.INK))
+        lines.append((L["hdr_low_basis"].format(basis=conf_basis_text(f, L)), 6.5, False, _Flow.MUTED))
+    else:
+        lines.append((L["hdr_low_none"], 7.5, False, _Flow.INK))
+    lines.append((f"OCAP: {OCAP_LEVELS[f.ocap_level][lang]}", 7.5, False, _Flow.WARN))
     if anonymized:
-        lines.append(L["hdr_anon"])
+        lines.append((L["hdr_anon"], 7.5, False, _Flow.INK))
     y = 0.905
-    for i, s in enumerate(lines):
-        ax.text(0.045, y, s, fontsize=8.5 if i < 3 else 7.5, va="top", ha="left",
-                color=_Flow.WARN if i == 4 else _Flow.INK, fontweight="bold" if i == 2 else "normal")
-        y -= 0.016
+    for s, size, bold, color in lines:
+        ax.text(0.045, y, s, fontsize=size, va="top", ha="left", color=color,
+                fontweight="bold" if bold else "normal")
+        y -= 0.016 if size >= 7.5 else 0.013
     mx = fig.add_axes((0.62, 0.80, 0.33, 0.10))
     pats = list(f.mix)
     cnt = [f.mix[p] for p in pats]
@@ -1008,7 +1120,7 @@ def _thumbnails(pdf: PdfPages, f: LotFindings, rec: pd.DataFrame, shown_lot: str
             r, c = divmod(i, ncol)
             ax = fig.add_axes((0.045 + c * cell_w + cell_w * 0.06, top - (r + 1) * cell_h + cell_h * 0.04,
                                cell_w * 0.88, cell_h * 0.78))
-            title, color = _wafer_title(w)
+            title, color = _wafer_title(w, f.conf_threshold)
             draw_thumbnail(ax, np.asarray(arrs[start + i]), title, f.notch_deg, color)
         y_free = top - nrow * cell_h - 0.01
     if rose and y_free - 0.255 < 0.06:        # 로즈 높이 0.20 + 제목 여백 0.055
@@ -1072,6 +1184,8 @@ def _write_sections(flow: _Flow, f: LotFindings, L: dict, lang: str, d2: str) ->
                                            pass_=L["v_cm_pass"] if r["this_lot_passed"] else L["v_cm_nopass"]),
                       size=7.5, indent=0.024)
         flow.line(L["v_cm_note"], size=7, indent=0.012, color=flow.MUTED)
+    elif f.commonality_note:
+        flow.line(L["v_cm_skip"].format(why=f.commonality_note), size=7, indent=0.012, color=flow.WARN)
     else:
         flow.line(L["v_cm_none"], size=7, indent=0.012, color=flow.MUTED)
 
@@ -1111,30 +1225,23 @@ def _write_sections(flow: _Flow, f: LotFindings, L: dict, lang: str, d2: str) ->
     flow.line(L["next_link"].format(link=CASE_STUDY_LINK), size=7.5, color=flow.MUTED)
 
 
-def resolve_lang(lang: str, quiet: bool = False) -> str:
-    """--lang ko 인데 한글 폰트가 없으면 en 으로 전환한다."""
-    if lang not in LABELS:
-        raise ValueError(f"lang must be one of {list(LABELS)}: {lang!r}")
-    if lang == "ko" and not has_korean_font():
-        if not quiet:
-            print(LABELS["ko"]["c_font_none"], file=sys.stderr)
-        return "en"
-    return lang
-
-
 def render_lot_pdf(findings: LotFindings, records_df: pd.DataFrame, out_path: Path, lang: str = "ko",
                    anonymize: bool = False, salt: bytes | None = None, quiet: bool = True) -> Path:
     """LotFindings 를 A4 PDF 로. 헤더 + 썸네일(+ 로즈) 뒤에 판정·배제·의심 모듈·증거·다음 행동이 이어진다.
 
     지면이 끝나면 자동으로 다음 페이지를 열므로 보통 1~2페이지(썸네일 36장 초과면 그 이상)다.
-    records_df 는 analyze_lot 에 준 것과 같아야 한다(썸네일용 waferMap). anonymize 면 로트명을 키드 해시로
-    바꾼다(같은 salt 면 JSON 과 같은 값). 페이지 수는 PDF 메타데이터 Subject 에 적는다. 반환: 저장 경로.
+    records_df 는 analyze_lot 에 준 것과 같아야 한다(썸네일용 waferMap). anonymize 면 로트명과 공통성 상위의
+    장비·챔버 ID 를 키드 해시로 바꾼다(같은 salt 면 JSON 과 같은 값). 언어 전환(resolve_lang)은
+    batch_wafer_report 와 같은 함수다. 페이지 수는 PDF 메타데이터 Subject 에 적는다. 반환: 저장 경로.
     """
     setup_korean_font()
     lang = resolve_lang(lang, quiet=quiet)
     L = LABELS[lang]
     f = findings
-    shown = anonymize_lot_id(f.lot, salt or os.urandom(8)) if anonymize else f.lot
+    if anonymize:
+        salt = salt or os.urandom(8)
+        f = replace(f, commonality_top=anonymize_commonality(f.commonality_top, salt))
+    shown = anonymize_lot_id(f.lot, salt) if anonymize else f.lot
     # 썸네일 순서를 analyze_lot 의 f.wafers(슬롯 순)와 맞춘다. wafer_index 가 없으면 records 의 행 순서.
     rec = records_df[records_df["lot"].astype(str) == f.lot].copy()
     if len(rec) == 0:
@@ -1281,7 +1388,13 @@ def _cli(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--notch-deg", type=float, default=DEFAULT_NOTCH_DEG,
                     help=f"맵 좌표계에서 노치 방향(도). 기본 {DEFAULT_NOTCH_DEG:g} 는 가정이다")
     ap.add_argument("--lang", choices=list(LABELS), default="ko", help="리포트 언어. 한글 폰트가 없으면 en 으로 자동 전환")
-    ap.add_argument("--anonymize", action="store_true", help="로트명을 키드 해시로 치환 (매핑 표 미저장)")
+    ap.add_argument("--anonymize", action="store_true",
+                    help="로트명과 공통성 상위의 장비·챔버 ID 를 키드 해시로 치환 (매핑 표 미저장)")
+    ap.add_argument("--conf-threshold", type=float, default=None,
+                    help=f"저신뢰 임계값. 없으면 예측 CSV 전체 confidence 의 --conf-quantile 분위수(유효 {MIN_N_CONF_QUANTILE}장 "
+                         f"이상일 때), 그것도 없으면 고정 {LOW_CONF_FALLBACK:g}. wm811k_spc 가 채택한 값을 넘기면 두 리포트가 맞는다")
+    ap.add_argument("--conf-quantile", type=float, default=CONF_QUANTILE,
+                    help=f"--conf-threshold 가 없을 때 쓰는 하위 분위수 (기본 {CONF_QUANTILE:g}, wm811k_spc 와 같다)")
     ap.add_argument("--output", type=Path, default=None, help="출력 폴더 (기본 HERE/lot_report_out, --demo 는 HERE/lot_report_demo)")
     ap.add_argument("--demo", action="store_true", help="합성 로트 3개로 PDF/JSON 생성 (로직 확인, 성능 아님)")
     return ap.parse_args(argv)
@@ -1293,15 +1406,21 @@ def main(argv: list[str] | None = None):
         return run_demo(a.output or HERE / "lot_report_demo", lang=a.lang, anonymize=a.anonymize)
     if a.path is None or a.lot is None:
         sys.exit("입력 pkl 과 --lot 이 필요하다 (또는 --demo).")
-    records = load_records(a.path, None)
-    preds = None
-    if a.pred is not None:
-        preds = pd.read_csv(a.pred)
-        preds["lot"] = preds["lot"].astype(str)
-    else:
-        print("[주의] --pred 가 없어 y_true(라벨)를 판정으로 쓴다.")
-    hist = load_lot_history(a.history) if a.history is not None else None
-    f = analyze_lot(records, preds, a.lot, history=hist, notch_deg=a.notch_deg)
+    try:
+        records = load_records(a.path, None)
+        preds = None
+        if a.pred is not None:
+            preds = pd.read_csv(a.pred)
+            if "lot" not in preds.columns or "y_pred" not in preds.columns:
+                raise ValueError(f"{a.pred.name}: lot, y_pred 열이 필요하다. 열: {list(preds.columns)}")
+            preds["lot"] = preds["lot"].astype(str)
+        else:
+            print("[주의] --pred 가 없어 y_true(라벨)를 판정으로 쓴다.")
+        hist = load_lot_history(a.history) if a.history is not None else None
+        f = analyze_lot(records, preds, a.lot, history=hist, notch_deg=a.notch_deg,
+                        conf_threshold=a.conf_threshold, conf_quantile=a.conf_quantile, verbose=True)
+    except ValueError as e:                         # 입력 문제는 traceback 대신 한 줄로
+        sys.exit(f"[오류] {e}")
     out = a.output or HERE / "lot_report_out"
     salt = os.urandom(8)
     shown = anonymize_lot_id(a.lot, salt) if a.anonymize else a.lot
@@ -1311,6 +1430,8 @@ def main(argv: list[str] | None = None):
     save_findings_json(f, js, anonymize=a.anonymize, salt=salt)
     print(f"lot {shown}: n={f.n} dominant={f.dominant} {f.dominant_count}/{f.n} repeat={f.repeat_verdict} "
           f"ocap={f.ocap_level} ({OCAP_LEVELS[f.ocap_level]['ko']})")
+    if f.n_low_conf is not None:
+        print(f"  저신뢰 {f.n_low_conf}장 (confidence < {f.conf_threshold:.3f}; {conf_basis_text(f, LABELS['ko'])})")
     for s in f.test_exclusion_flags:
         print(f"  ! {s}")
     for s in f.suspects[:3]:

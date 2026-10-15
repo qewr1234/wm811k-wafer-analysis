@@ -46,9 +46,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.model_selection import GroupKFold
 
+from wm811k_evaluate import load_defect_frame, skipped_note
 from wm811k_structural import (
-    ALL_FEATURES, CLASSES, GLOBAL_FEATURES, LABEL_MAP, MIN_DIE,
-    STRUCT_FEATURES, structural_features,
+    ALL_FEATURES, CLASSES, MIN_DIE, auc_one_vs_rest, structural_features,
 )
 from wafer_map_visualizer import wafermap_to_df
 from wafer_pattern_classifier import classify_wafer_pattern
@@ -114,37 +114,24 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
         print(f"캐시 사용: {CACHE2}")
         return pd.read_csv(CACHE2)
 
-    if path is None:
-        for name in ["wm811k_defects.pkl", "LSWMD.pkl"]:
-            if (DATA_DIR / name).exists():
-                path = DATA_DIR / name
-                break
-        else:
-            sys.exit(f"데이터 파일을 찾을 수 없다. {DATA_DIR} 에 wm811k_defects.pkl 이 있어야 한다.")
-
-    print(f"로드: {path.name}")
-    df = pd.read_pickle(path)
-    if "ftype" not in df.columns:
-        df["ftype"] = df["failureType"].apply(
-            lambda v: str(np.asarray(v).reshape(-1)[0]) if np.asarray(v).size else None)
-    df["lot"] = (df["lotName"] if "lotName" in df.columns else "unknown").astype(str)
-    # waferIndex 는 식별용으로만 보존한다 (특징값에는 쓰지 않는다). 없으면 NaN.
-    df["wafer_index"] = (pd.to_numeric(df["waferIndex"], errors="coerce")
-                         if "waferIndex" in df.columns else np.nan)
-    df = df[df["ftype"].isin(LABEL_MAP)].copy()
-    df["y_true"] = df["ftype"].map(LABEL_MAP)
+    # wafer_index 는 식별용으로만 보존한다 (특징값에는 쓰지 않는다). 없으면 NaN.
+    df = load_defect_frame(path, DATA_DIR)
 
     recs, t0 = [], time.time()
+    n_skip, first_err = 0, None
     for i, (wmap, y, lot, widx) in enumerate(
             zip(df["waferMap"], df["y_true"], df["lot"], df["wafer_index"])):
         arr = np.asarray(wmap)
         if arr.ndim != 2 or (arr > 0).sum() < MIN_DIE:
+            n_skip += 1
             continue
         try:
             r = classify_wafer_pattern(wafermap_to_df(arr))
             st = structural_features(arr)
             nf = largest_component_features(arr)
-        except Exception:
+        except Exception as e:                   # 퇴화된 맵 방어. 건수는 끝에 보고한다
+            n_skip += 1
+            first_err = first_err or f"{type(e).__name__}: {e}"
             continue
         recs.append({
             "y_true": y, "lot": lot, "wafer_index": widx,
@@ -157,7 +144,8 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
             print(f"  {i + 1}/{len(df)} ({time.time() - t0:.0f}s)")
     out = pd.DataFrame(recs)
     out.to_csv(CACHE2, index=False, encoding="utf-8-sig")
-    print(f"저장: {CACHE2} ({len(out)}행, 특징 {len(FEATS_B)}개)")
+    print(f"저장: {CACHE2} ({len(out)}행, 특징 {len(FEATS_B)}개; "
+          f"{skipped_note(len(df), n_skip, first_err)})")
     return out
 
 
@@ -182,10 +170,7 @@ def make_rf(min_leaf: int = 2) -> RandomForestClassifier:
                                   random_state=42, n_jobs=-1)
 
 
-def auc_ovr(pos, neg) -> float:
-    a = np.concatenate([pos, neg]); r = pd.Series(a).rank().to_numpy()
-    n1, n0 = len(pos), len(neg)
-    return (r[:n1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0) if n1 and n0 else 0.5
+auc_ovr = auc_one_vs_rest                  # 순위합 AUC (wm811k_structural 과 같은 구현)
 
 
 # ──────────────────────────────────────────
@@ -254,7 +239,8 @@ def main(path: Path | None = None, seeds: list[int] | None = None,
         pa = make_rf().fit(XA[tr], y[tr]).predict(XA[te])
         pb = make_rf().fit(XB[tr], y[tr]).predict(XB[te])
         a, b = macro_f1(y[te], pa), macro_f1(y[te], pb)
-        resA.append(a); resB.append(b)
+        resA.append(a)
+        resB.append(b)
         cls_A.append(f1_score(y[te], pa, average=None, labels=CLASSES, zero_division=0))
         cls_B.append(f1_score(y[te], pb, average=None, labels=CLASSES, zero_division=0))
         cm_B += confusion_matrix(y[te], pb, labels=CLASSES)

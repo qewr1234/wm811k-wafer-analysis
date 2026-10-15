@@ -7,7 +7,7 @@
 #   달라지는가"가 장비 서명이다. 보트 양끝은 온도 램프·가스 고갈(depletion)·더미 웨이퍼와의
 #   경계 조건이 가운데와 달라 끝 슬롯에 EDGE_RING 폭이 넓어지거나 막 두께가 틀어지는 식으로
 #   나타나고(공개 특허·교과서 수준의 일반 물리), 단조 기울기는 보트 축 방향 온도·가스 구배의
-#   서명이다. docs/defect_signatures.md 현장 순서 2번이 "슬롯 위치와의 상관을 본다"고 적고
+#   서명이다. docs/defect_signatures.md 현장 순서 3번이 "슬롯 위치와의 상관을 본다"고 적고
 #   있었으나 코드가 없었다. 이 모듈은 그 검정을 코드로 고정한다.
 #
 #   WM-811K 에 대해 (중요): 예측 CSV 의 wafer_index 는 WM-811K 의 waferIndex 를 옮긴 것이다.
@@ -25,6 +25,8 @@
 #   plot_slot_profile 슬롯별 발생률 막대 + Wilson 구간 + 전체 발생률 선. 라벨은 영문(폰트 무관).
 #   CLI               predictions.csv (lot, wafer_index, y_pred) --pattern EDGE_RING --output DIR.
 #                     --demo 는 합성 3시나리오(끝 슬롯 +50% / 효과 없음 / 로트 혼입)로 로직 확인.
+#   load_predictions / _format_summary / run / run_demo 는 wm811k_spc·wm811k_commonality 에도 같은 이름으로
+#   있지만 입력 형식과 검사 항목이 다르다(여기서는 슬롯 열 필수). 모듈 밖에서는 모듈명을 붙여 쓴다.
 #
 # 왜 p 값이 둘인가 (p_pooled 와 p_cluster)
 #   같은 로트의 웨이퍼는 패턴을 공유한다. 로트마다 모든 슬롯이 고르게 들어 있으면(완전한 로트)

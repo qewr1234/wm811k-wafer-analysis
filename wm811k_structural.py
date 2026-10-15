@@ -33,10 +33,11 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,7 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 
 from wafer_map_visualizer import wafermap_to_df
 from wafer_pattern_classifier import classify_wafer_pattern
+from wm811k_evaluate import CLASSES, MIN_DIE, load_defect_frame, skipped_note
 
 if sys.platform == "win32":                      # Windows 콘솔 한글 깨짐 방지
     sys.stdout.reconfigure(encoding="utf-8")
@@ -58,21 +60,13 @@ HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("WM811K_DIR", HERE / "data"))   # 환경변수 또는 스크립트 옆 data/
 CACHE = HERE / "wm811k_features_ext.csv"                   # 실행 폴더와 무관하게 스크립트 옆에
 
-CLASSES = ["CENTER", "DONUT", "EDGE_LOC", "EDGE_RING",
-           "LOC", "NEAR_FULL", "RANDOM", "SCRATCH"]
-
+# CLASSES / LABEL_MAP(결함 8종) / MIN_DIE 는 wm811k_evaluate 와 한 소스다.
 GLOBAL_FEATURES = ["fail_frac", "r_mean", "r_med", "r_std", "dir_c", "axial_c"]
 STRUCT_FEATURES = ["n_comp", "largest_frac", "elongation", "comp_size_mean",
                    "outer_cover", "outer_rate",
                    "prof0", "prof1", "prof2", "prof3", "prof4"]
 ALL_FEATURES = GLOBAL_FEATURES + STRUCT_FEATURES
 
-LABEL_MAP = {
-    "Edge-Ring": "EDGE_RING", "Edge-Loc": "EDGE_LOC", "Center": "CENTER",
-    "Loc": "LOC", "Scratch": "SCRATCH", "Random": "RANDOM",
-    "Donut": "DONUT", "Near-full": "NEAR_FULL",
-}
-MIN_DIE = 100
 N_ANGLE_BINS = 24
 OUTER_R = 0.75
 N_RADIAL_BINS = 5
@@ -162,33 +156,21 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
         print(f"캐시 사용: {CACHE}")
         return pd.read_csv(CACHE)
 
-    if path is None:
-        for name in ["wm811k_defects.pkl", "LSWMD.pkl"]:
-            if (DATA_DIR / name).exists():
-                path = DATA_DIR / name
-                break
-        else:
-            sys.exit(f"데이터 파일을 찾을 수 없다. {DATA_DIR} 에 wm811k_defects.pkl 이 있어야 한다.")
-
-    print(f"로드: {path.name}")
-    df = pd.read_pickle(path)
-    if "ftype" not in df.columns:
-        df["ftype"] = df["failureType"].apply(
-            lambda v: str(np.asarray(v).reshape(-1)[0]) if np.asarray(v).size else None
-        )
-    df["lot"] = (df["lotName"] if "lotName" in df.columns else "unknown").astype(str)
-    df = df[df["ftype"].isin(LABEL_MAP)].copy()
-    df["y_true"] = df["ftype"].map(LABEL_MAP)
+    df = load_defect_frame(path, DATA_DIR)
 
     recs, t0 = [], time.time()
+    n_skip, first_err = 0, None
     for i, (wmap, y, lot) in enumerate(zip(df["waferMap"], df["y_true"], df["lot"])):
         arr = np.asarray(wmap)
         if arr.ndim != 2 or (arr > 0).sum() < MIN_DIE:
+            n_skip += 1
             continue
         try:
             r = classify_wafer_pattern(wafermap_to_df(arr))
             st = structural_features(arr)
-        except Exception:
+        except Exception as e:                   # 퇴화된 맵 방어. 건수는 끝에 보고한다
+            n_skip += 1
+            first_err = first_err or f"{type(e).__name__}: {e}"
             continue
         recs.append({
             "y_true": y, "lot": lot,
@@ -202,7 +184,8 @@ def build_features(path: Path | None = None) -> pd.DataFrame:
 
     out = pd.DataFrame(recs)
     out.to_csv(CACHE, index=False, encoding="utf-8-sig")
-    print(f"저장: {CACHE} ({len(out)}행, 특징 {len(ALL_FEATURES)}개)")
+    print(f"저장: {CACHE} ({len(out)}행, 특징 {len(ALL_FEATURES)}개; "
+          f"{skipped_note(len(df), n_skip, first_err)})")
     return out
 
 
@@ -399,7 +382,7 @@ def main(path: Path | None = None):
 
     print(f"\n{'=' * 78}\n구조적 특징의 판별력 (AUC, 0.5 아래는 방향 반대)\n{'=' * 78}")
     print(auc_table(F, STRUCT_FEATURES).to_string())
-    print(f"\n비교 — 전역 특징")
+    print("\n비교 - 전역 특징")
     print(auc_table(F, GLOBAL_FEATURES).to_string())
 
     results, preds = {}, {}
@@ -444,7 +427,7 @@ def main(path: Path | None = None):
     for k, (a, b) in results.items():
         print(f"  {k:14s} {a:8.4f} {b:8.4f}")
 
-    print(f"\n  구조적 특징의 기여")
+    print("\n  구조적 특징의 기여")
     print(f"    규칙: {results['규칙(전역)'][1]:.4f} → "
           f"{results['규칙(확장)'][1]:.4f}  "
           f"({results['규칙(확장)'][1] - results['규칙(전역)'][1]:+.4f})")
@@ -461,7 +444,7 @@ def main(path: Path | None = None):
     tab["개선(RF확장-RF전역)"] = (tab["RF(확장)"] - tab["RF(전역)"]).round(3)
     print(tab.to_string())
 
-    print(f"\n  RF(확장) test 상세:")
+    print("\n  RF(확장) test 상세:")
     print(classification_report(te["y_true"], preds["RF(확장)"], labels=CLASSES,
                                 digits=3, zero_division=0))
     print("  Confusion matrix (행=실제, 열=예측)")
@@ -470,7 +453,7 @@ def main(path: Path | None = None):
         index=[f"실제 {c}" for c in CLASSES],
         columns=[f"→{c}" for c in CLASSES]).to_string())
 
-    print(f"\n  트리(확장) 구조 (깊이 3까지):")
+    print("\n  트리(확장) 구조 (깊이 3까지):")
     print(export_text(
         DecisionTreeClassifier(max_depth=3, class_weight="balanced",
                                random_state=42)
@@ -484,5 +467,15 @@ def main(path: Path | None = None):
     print(f"저장: {out_csv}\n      {CACHE}")
 
 
+def _cli(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="WM-811K 구조적 특징(연결 성분·각도 커버리지·반경 프로파일) 추가 후 "
+                    "규칙/트리/RF 를 전역 특징과 비교 (로트 분할 시드 42, 단일 분할)")
+    ap.add_argument("path", nargs="?", type=Path, default=None,
+                    help="wm811k_defects.pkl 경로 (기본: WM811K_DIR 또는 data/). "
+                         f"특징 캐시 {CACHE.name} 가 스크립트 옆에 있으면 그것을 쓴다")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    main(Path(sys.argv[1]) if len(sys.argv) > 1 else None)
+    main(_cli().path)

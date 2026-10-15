@@ -53,6 +53,9 @@
 #   [개선] defect_mode를 wafer_map_visualizer와 동일한 7종으로 통일
 #   [개선] write_html 기본 include_plotlyjs=True (오프라인), --cdn 옵션, 저장 경로 HERE 기준,
 #          실측 CSV(die_x, die_y, value) 입력 --csv, Windows 콘솔 UTF-8.
+#   [버그] 콘솔 요약이 그림과 다른 시드(기본 2024)로 맵을 다시 만들어 수율·FAIL 수가 HTML 제목과
+#          달랐다(center 93.2% vs 93.7%). → resolve_fields() 한 곳에서 만들어 그림과 콘솔이 공유.
+#   [개선] --demo 와 --csv 동시 지정, --spec-frac 범위 밖은 사용법 오류로 거부.
 
 from __future__ import annotations
 
@@ -209,6 +212,21 @@ def field_from_csv(
     return WaferField(Z=Z, x=x, y=y, target=t, spec_lo=t - tol, spec_hi=t + tol, radius=radius)
 
 
+def resolve_fields(lot_data: list[dict]) -> list[WaferField]:
+    """lot_data 항목마다 WaferField 를 돌려준다: "field"(실측) 는 그대로, 아니면 "mode"(합성) 로 생성.
+
+    합성 시드는 명시된 "seed" 가 없으면 2024 + i (웨이퍼마다 다르게). 그림과 콘솔 요약이 이 한 함수를
+    같이 쓰므로 둘의 수율·FAIL 수가 어긋나지 않는다(이전에는 콘솔이 기본 시드로 다시 생성해 달랐다).
+    """
+    return [d["field"] if "field" in d
+            else create_wafer_heatmap_data(defect_mode=d.get("mode", "random"), seed=d.get("seed", 2024 + i))
+            for i, d in enumerate(lot_data)]
+
+
+def _label(d: dict) -> str:
+    return d.get("label", "measured" if "field" in d else d.get("mode", "random"))
+
+
 def create_interactive_wafer_heatmap(
     lot_data: list[dict],
     value_name: str = "두께",
@@ -217,24 +235,15 @@ def create_interactive_wafer_heatmap(
 ) -> go.Figure:
     """여러 웨이퍼의 파라메트릭 맵을 서브플롯으로 구성.
 
-    lot_data 항목: {"lot_id", "wafer_id", "mode"(합성) 또는 "field"(WaferField, 실측)}.
+    lot_data 항목: {"lot_id", "wafer_id", "mode"(합성) 또는 "field"(WaferField, 실측), "seed"(선택)}.
     """
     n = len(lot_data)
     cols = min(cols_max, n)
     rows = (n + cols - 1) // cols
 
-    fields, titles = [], []
-    for i, d in enumerate(lot_data):
-        if "field" in d:
-            f = d["field"]
-            label = d.get("label", "measured")
-        else:
-            f = create_wafer_heatmap_data(
-                defect_mode=d.get("mode", "random"),
-                seed=d.get("seed", 2024 + i),      # 웨이퍼마다 다른 시드
-            )
-            label = d.get("mode", "random")
-        fields.append(f)
+    fields, titles = resolve_fields(lot_data), []
+    for d, f in zip(lot_data, fields):
+        label = _label(d)
         titles.append(
             f"{d['lot_id']} / {d['wafer_id']} ({label})<br>"
             f"<sub>Yield {f.yield_pct:.1f}%  |  "
@@ -318,14 +327,10 @@ def write_heatmap_html(fig: go.Figure, out: Path, cdn: bool = False) -> Path:
 
 
 def _demo_wafers() -> list[dict]:
-    return [
-        {"lot_id": "LOT_A", "wafer_id": "W01", "mode": "ring"},
-        {"lot_id": "LOT_A", "wafer_id": "W02", "mode": "center"},
-        {"lot_id": "LOT_B", "wafer_id": "W01", "mode": "random"},
-        {"lot_id": "LOT_B", "wafer_id": "W02", "mode": "donut"},
-        {"lot_id": "LOT_C", "wafer_id": "W01", "mode": "scratch"},
-        {"lot_id": "LOT_C", "wafer_id": "W02", "mode": "clean"},
-    ]
+    modes = ["ring", "center", "random", "donut", "scratch", "clean"]
+    lots = ["LOT_A", "LOT_A", "LOT_B", "LOT_B", "LOT_C", "LOT_C"]
+    return [{"lot_id": lot, "wafer_id": f"W{i % 2 + 1:02d}", "mode": m, "seed": 2024 + i}   # 시드 명시 (그림 = 콘솔)
+            for i, (lot, m) in enumerate(zip(lots, modes))]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -344,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cdn", action="store_true",
                     help="plotly.js 를 CDN 에서 로드 (파일 작음, 인터넷 필요). 기본은 HTML 에 포함")
     args = ap.parse_args(argv)
+    if args.demo and args.csv:
+        ap.error("--demo 와 --csv 는 함께 쓸 수 없다 (CSV 를 주면 실측 모드, 없으면 합성 데모)")
+    if not 0 < args.spec_frac < 1:
+        ap.error(f"--spec-frac 은 0 과 1 사이여야 한다: {args.spec_frac}")
 
     if args.csv:
         wafers = []
@@ -359,10 +368,9 @@ def main(argv: list[str] | None = None) -> int:
     out = write_heatmap_html(fig, args.out, cdn=args.cdn)
     print(f"저장: {out}  ({source}, plotly.js {'CDN' if args.cdn else '포함'}, {out.stat().st_size / 1e6:.1f} MB)")
 
-    for w in wafers:
-        f = w["field"] if "field" in w else create_wafer_heatmap_data(defect_mode=w["mode"])
+    for w, f in zip(wafers, resolve_fields(wafers)):          # 그림과 같은 시드 -> 같은 수율
         m = np.isfinite(f.Z)
-        label = w.get("label", w.get("mode", ""))
+        label = _label(w)
         print(f"  {label:9s} 다이 {f.n_die:4d}  FAIL {f.n_fail:4d}  "
               f"Yield {f.yield_pct:5.1f}%  "
               f"{args.value_name} {f.Z[m].mean():6.1f} +/- {f.Z[m].std():4.1f}")
